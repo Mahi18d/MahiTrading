@@ -26,7 +26,6 @@ st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
 
-    /* Abstract Multi-Color Cosmic Dark Mesh Background */
     .stApp {
         background-color: #070913;
         background-image: 
@@ -40,7 +39,6 @@ st.markdown("""
         font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
     }
 
-    /* Top Abstract Brand Header */
     .header-box {
         display: flex;
         justify-content: space-between;
@@ -53,11 +51,23 @@ st.markdown("""
         margin-bottom: 14px;
         box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
     }
+    .header-left {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+    }
+    .logo-container {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        filter: drop-shadow(0 0 12px rgba(0, 242, 254, 0.45));
+    }
     .brand-title {
         font-size: 28px;
         font-weight: 800;
         color: #ffffff;
         letter-spacing: -0.5px;
+        line-height: 1.1;
     }
     .brand-accent {
         background: linear-gradient(90deg, #00f2fe, #4facfe, #a855f7);
@@ -70,7 +80,7 @@ st.markdown("""
         text-transform: uppercase;
         letter-spacing: 1px;
         font-weight: 600;
-        margin-top: 2px;
+        margin-top: 4px;
     }
     .status-badge {
         background: linear-gradient(135deg, rgba(16, 185, 129, 0.2), rgba(6, 182, 212, 0.2));
@@ -83,7 +93,6 @@ st.markdown("""
         font-family: 'JetBrains Mono', monospace;
     }
 
-    /* Dedicated Universe Selection Strip */
     .universe-strip {
         background: linear-gradient(90deg, rgba(15, 23, 42, 0.8) 0%, rgba(20, 20, 45, 0.8) 100%);
         border: 1px solid rgba(0, 242, 254, 0.2);
@@ -124,7 +133,6 @@ st.markdown("""
     .tag-bull { color: #34d399; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
     .tag-bear { color: #fb7185; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
 
-    /* Amount Calculation Card */
     .calc-box {
         background: linear-gradient(135deg, rgba(15, 23, 42, 0.9) 0%, rgba(30, 27, 75, 0.7) 100%);
         border: 1px solid rgba(99, 102, 241, 0.3);
@@ -233,7 +241,6 @@ def connect_angel_one(api_key: str, client_code: str, pin: str, totp_secret: str
     except Exception as e:
         return None, str(e)
 
-# Auto-connect if secrets are available
 if "smart_api" not in st.session_state and all([def_api_key, def_client_id, def_pin, def_totp]):
     api_instance, _ = connect_angel_one(def_api_key, def_client_id, def_pin, def_totp)
     if api_instance:
@@ -282,7 +289,7 @@ def place_regular_order(smart_api, symbol: str, token: str, qty: int, transactio
     except Exception as e:
         return False, str(e)
 
-# --- Basket Universes ---
+# --- Market Universes ---
 INDEX_BASKETS = {
     "NIFTY 50": [
         "ADANIENT.NS", "ADANIPORTS.NS", "APOLLOHOSP.NS", "ASIANPAINT.NS", "AXISBANK.NS",
@@ -332,13 +339,32 @@ HORIZON_MAP = {
     "Long Term (Weekly)": ("5y", "1wk", 10)
 }
 
-# --- Header ---
+# --- Abstract Vector Logo & Header Box ---
 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+SVG_LOGO = """
+<svg width="46" height="46" viewBox="0 0 716 716" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <linearGradient id="brandLogoGrad" x1="180" y1="180" x2="530" y2="530" gradientUnits="userSpaceOnUse">
+            <stop offset="0%" stop-color="#00f2fe"/>
+            <stop offset="50%" stop-color="#4facfe"/>
+            <stop offset="100%" stop-color="#a855f7"/>
+        </linearGradient>
+    </defs>
+    <path d="M508.749 317.399C516.777 287.314 508.991 253.884 485.389 230.282C461.788 206.681 428.36 198.895 398.273 206.923C376.231 184.928 343.39 174.956 311.148 183.596C278.906 192.234 255.45 217.292 247.36 247.361C217.291 255.451 192.233 278.91 183.595 311.149C174.957 343.391 184.927 376.232 206.924 398.274C198.896 428.359 206.683 461.789 230.284 485.391C253.885 508.992 287.313 516.779 317.401 508.75C339.442 530.745 372.286 540.717 404.525 532.079C436.767 523.441 460.223 498.384 468.313 468.315C498.383 460.224 523.44 436.766 532.078 404.526C540.716 372.285 530.747 339.443 508.749 317.402V317.399ZM470.899 244.776C486.892 260.77 493.488 282.601 490.687 303.412L415.577 260.046C412.411 258.218 408.509 258.218 405.345 260.046L317.401 310.82V277.526C317.401 275.191 318.652 273.005 320.676 271.837L387.644 233.174C414.178 218.353 448.346 222.223 470.901 244.776H470.899ZM357.837 311.144L398.275 334.491V381.185L357.837 404.532L317.398 381.185V334.491L357.837 311.144ZM264.776 269.693C265.207 239.305 285.644 211.649 316.453 203.393C338.3 197.54 360.505 202.744 377.127 215.573L302.014 258.937C298.848 260.764 296.898 264.144 296.898 267.798V369.346L268.065 352.699C266.043 351.531 264.776 349.353 264.776 347.017V269.691V269.693ZM203.391 316.454C209.244 294.608 224.854 277.978 244.276 269.999V356.73C244.276 360.384 246.226 363.763 249.392 365.591L337.337 416.365L308.503 433.013C306.481 434.181 303.961 434.188 301.939 433.02L234.971 394.357C208.868 378.789 195.138 347.261 203.391 316.454ZM244.775 470.9C228.781 454.906 222.186 433.075 224.986 412.264L300.096 455.63C303.263 457.457 307.164 457.457 310.328 455.63L398.273 404.856V438.149C398.273 440.485 397.022 442.671 394.997 443.839L328.029 482.502C301.495 497.322 267.327 493.452 244.772 470.9H244.775ZM450.897 445.982C450.466 476.371 430.029 504.027 399.22 512.283C377.373 518.136 355.168 512.932 338.547 500.102L413.659 456.738C416.826 454.911 418.775 451.532 418.775 447.877V346.329L447.609 362.977C449.631 364.145 450.897 366.323 450.897 368.659V445.985V445.982ZM512.282 399.221C506.429 421.068 490.819 437.697 471.397 445.676V358.946C471.397 355.292 469.448 351.912 466.281 350.085L378.336 299.311L407.17 282.663C409.192 281.495 411.712 281.487 413.734 282.655L480.702 321.318C506.805 336.887 520.536 368.415 512.282 399.221Z" fill="url(#brandLogoGrad)"/>
+</svg>
+"""
+
 st.markdown(f"""
 <div class="header-box">
-    <div>
-        <div class="brand-title">Mahi <span class="brand-accent">Trading</span></div>
-        <div class="brand-sub">Multi-Asset Algorithmic Intelligence & Automated Risk Exits</div>
+    <div class="header-left">
+        <div class="logo-container">
+            {SVG_LOGO}
+        </div>
+        <div>
+            <div class="brand-title">Mahi <span class="brand-accent">Trading</span></div>
+            <div class="brand-sub">Multi-Asset Algorithmic Intelligence & Automated Risk Exits</div>
+        </div>
     </div>
     <div style="text-align:right;">
         <span class="status-badge">● LIVE MARKET</span>
@@ -374,7 +400,7 @@ main_tab_equity, main_tab_fo, tab_backtest, tab_chart = st.tabs([
 ])
 
 # =========================================================================
-# TAB 1: EQUITY INTELLIGENCE + AMOUNT & P&L CALCULATOR
+# TAB 1: EQUITY INTELLIGENCE (10-POINT STRATEGY + 1:3 RISK-TO-REWARD ENGINE)
 # =========================================================================
 with main_tab_equity:
     eq_f1, eq_f2, eq_f3 = st.columns([3, 3, 4])
@@ -387,17 +413,18 @@ with main_tab_equity:
 
     st.markdown("""
     <div class="disclaimer-banner">
-        Cash Market Screener: Algorithmic 10-point checklist, dynamic position sizing & real-time capital payoff.
+        Algorithmic 10-Point Technical Engine: MTF Daily 50 EMA, Session VWAP, ORB Breakout & Dynamic 1:3 ROBO Risk Exits.
     </div>
     """, unsafe_allow_html=True)
 
     @st.cache_data(ttl=180)
-    def fetch_basket_data(basket_name: str, period: str, interval: str):
+    def fetch_equity_and_daily_data(basket_name: str, period: str, interval: str):
         symbols = INDEX_BASKETS[basket_name]
-        data = yf.download(symbols, period=period, interval=interval, group_by='ticker', progress=False, threads=True)
-        return symbols, data
+        intraday_data = yf.download(symbols, period=period, interval=interval, group_by='ticker', progress=False, threads=True)
+        daily_data = yf.download(symbols, period="1y", interval="1d", group_by='ticker', progress=False, threads=True)
+        return symbols, intraday_data, daily_data
 
-    symbols, data = fetch_basket_data(selected_basket, period, interval)
+    symbols, data, daily_data = fetch_equity_and_daily_data(selected_basket, period, interval)
 
     rows = []
     checklists = {}
@@ -405,54 +432,94 @@ with main_tab_equity:
     for sym in symbols:
         try:
             df = data[sym].dropna()
-            if len(df) < 30:
+            if len(df) < 25:
                 continue
 
             close = df['Close']
             high = df['High']
             low = df['Low']
             volume = df['Volume']
+            open_s = df['Open']
 
+            # Intraday Moving Averages
             ema20 = close.ewm(span=20, adjust=False).mean()
             ema50 = close.ewm(span=50, adjust=False).mean()
-            ema200 = close.ewm(span=200, adjust=False).mean() if len(df) >= 200 else ema50
 
+            # RSI Calculation
             delta = close.diff()
             gain = (delta.where(delta > 0, 0)).rolling(14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
             rs = gain / loss.replace(0, np.nan)
             rsi = 100 - (100 / (1 + rs))
 
+            # ATR for Order Sizing
             tr1 = high - low
             tr2 = (high - close.shift(1)).abs()
             tr3 = (low - close.shift(1)).abs()
             tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
             atr_val = float(tr.rolling(14).mean().iloc[-1])
 
+            # Intraday VWAP Calculation (Cumulative)
+            typical_price = (high + low + close) / 3.0
+            cum_vol = volume.cumsum()
+            vwap_series = (typical_price * volume).cumsum() / cum_vol.replace(0, np.nan)
+            c_vwap = float(vwap_series.iloc[-1]) if pd.notna(vwap_series.iloc[-1]) else float(close.iloc[-1])
+
+            # Opening Range (First Candle High / Low)
+            orb_high = float(high.iloc[0])
+            orb_low = float(low.iloc[0])
+
+            # Support & Resistance Extrema
+            res = float(high.iloc[-extrema_order:].max())
+            sup = float(low.iloc[-extrema_order:].min())
+
             c_ltp = float(close.iloc[-1])
             c_prev = float(close.iloc[-2])
+            c_open = float(open_s.iloc[0])
             chg_pct = ((c_ltp - c_prev) / c_prev) * 100
             c_rsi = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
             c_ema20 = float(ema20.iloc[-1])
             c_ema50 = float(ema50.iloc[-1])
-            c_ema200 = float(ema200.iloc[-1])
             cur_vol = float(volume.iloc[-1])
-            avg_vol = float(volume.iloc[-20:].mean()) if len(volume) >= 20 else cur_vol
+            avg_vol_20 = float(volume.iloc[-20:].mean()) if len(volume) >= 20 else cur_vol
 
-            res = float(high.iloc[-extrema_order:].max())
-            sup = float(low.iloc[-extrema_order:].min())
+            # Condition 1: MTF Daily 50 EMA Macro Filter
+            c_daily_ema50 = c_ltp
+            d_ok = False
+            try:
+                df_day = daily_data[sym].dropna()
+                if len(df_day) >= 50:
+                    d_ema = df_day['Close'].ewm(span=50, adjust=False).mean()
+                    c_daily_ema50 = float(d_ema.iloc[-1])
+                    d_ok = c_ltp > c_daily_ema50
+                else:
+                    d_ok = c_ltp > c_ema50
+            except Exception:
+                d_ok = c_ltp > c_ema50
+
+            # 10-Point Strategy Evaluation
+            c1_pass = d_ok
+            c2_pass = c_ltp > c_vwap
+            c3_pass = c_ltp > orb_high
+            c4_pass = c_ltp > c_ema20
+            c5_pass = c_ltp > c_ema50
+            c6_pass = 50.0 <= c_rsi <= 70.0
+            c7_pass = cur_vol > (1.25 * avg_vol_20)
+            c8_pass = c_ltp > c_open
+            c9_pass = (((c_ltp - sup) / c_ltp) <= 0.02) or (c_ltp >= orb_high)
+            c10_pass = ((res - c_ltp) / c_ltp) >= 0.02
 
             checks = [
-                ("Price above 20 EMA", c_ltp > c_ema20, "Short-term momentum"),
-                ("Price above 50 EMA", c_ltp > c_ema50, "Intermediate baseline"),
-                ("50 EMA > 200 EMA", c_ema50 > c_ema200, "Macro trend confirmation"),
-                ("RSI in Momentum (50 - 70)", 50 <= c_rsi <= 70, f"RSI @ {c_rsi:.1f}"),
-                ("Volume Expansion (> Avg)", cur_vol > avg_vol, "Volume participation"),
-                ("Trading Near Support (< 2%)", ((c_ltp - sup)/c_ltp) <= 0.02, f"Support @ ₹{sup:.2f}"),
-                ("Resistance Clearance (> 2%)", ((res - c_ltp)/c_ltp) >= 0.02, f"Resistance @ ₹{res:.2f}"),
-                ("Positive Session Return", chg_pct > 0, f"{chg_pct:+.2f}% session"),
-                ("No Overbought Exhaustion (< 75)", c_rsi < 75, "Room for upside"),
-                ("S/R Range Compression", (res - sup)/c_ltp <= 0.08, "Volatility squeeze")
+                ("1. MTF Macro Filter", c1_pass, f"Daily 50 EMA: ₹{c_daily_ema50:.2f}"),
+                ("2. VWAP Baseline", c2_pass, f"VWAP: ₹{c_vwap:.2f}"),
+                ("3. ORB Breakout", c3_pass, f"ORB High: ₹{orb_high:.2f}"),
+                ("4. Short-Term Trend", c4_pass, f"20 EMA: ₹{c_ema20:.2f}"),
+                ("5. Intermediate Trend", c5_pass, f"50 EMA: ₹{c_ema50:.2f}"),
+                ("6. RSI Momentum Corridor", c6_pass, f"RSI @ {c_rsi:.1f} (50-70)"),
+                ("7. Volume Expansion", c7_pass, f"{cur_vol:,.0f} vs {1.25*avg_vol_20:,.0f}"),
+                ("8. Positive Session Momentum", c8_pass, f"Open: ₹{c_open:.2f} ({chg_pct:+.2f}%)"),
+                ("9. Support/Breakout Validation", c9_pass, "Near Support or Confirmed ORB"),
+                ("10. Room to Target", c10_pass, f"Res: ₹{res:.2f} (≥2% clearance)")
             ]
 
             buy_score = sum(1 for _, met, _ in checks if met)
@@ -475,6 +542,9 @@ with main_tab_equity:
                 "ltp": c_ltp,
                 "chg": chg_pct,
                 "rsi": c_rsi,
+                "vwap": c_vwap,
+                "orb_high": orb_high,
+                "orb_low": orb_low,
                 "atr": atr_val if (pd.notna(atr_val) and atr_val > 0) else (c_ltp * 0.015),
                 "support": sup,
                 "resistance": res,
@@ -489,6 +559,7 @@ with main_tab_equity:
                 "Price": round(c_ltp, 2),
                 "Chg%": round(chg_pct, 2),
                 "Trend": trend_status,
+                "VWAP": round(c_vwap, 2),
                 "RSI": round(c_rsi, 1),
                 "Buy": f"{buy_score}/10",
                 "Sell": f"{sell_score}/10",
@@ -519,6 +590,7 @@ with main_tab_equity:
             column_config={
                 "Price": st.column_config.NumberColumn(format="₹%.2f"),
                 "Chg%": st.column_config.NumberColumn(format="%+.2f%%"),
+                "VWAP": st.column_config.NumberColumn(format="₹%.2f"),
                 "RSI": st.column_config.NumberColumn(format="%.1f"),
             },
             height=620
@@ -541,9 +613,12 @@ with main_tab_equity:
             stock = checklists[active_sym]
             chg_c = "#34d399" if stock['chg'] >= 0 else "#fb7185"
 
+            # -------------------------------------------------------------
+            # 1:3 RISK-TO-REWARD RATIO CALCULATIONS
+            # -------------------------------------------------------------
             atr_val = stock['atr']
             stop_points = round(float(1.5 * atr_val), 1)
-            target_points = round(float(3.0 * atr_val), 1)
+            target_points = round(float(4.5 * atr_val), 1)  # 3x Stop Loss = 1:3 RRR
 
             is_bull = stock['buy_score'] >= stock['sell_score']
             sl_price = stock['ltp'] - stop_points if is_bull else stock['ltp'] + stop_points
@@ -568,13 +643,13 @@ with main_tab_equity:
                     </span>
                 </div>
                 <div style="display:flex; justify-content:space-between; font-size:12px; margin: 10px 0; padding: 8px 12px; background:rgba(30, 41, 59, 0.6); border-radius:6px;">
-                    <div>SUP: <strong style="color:#34d399">₹{stock['support']:.2f}</strong></div>
-                    <div>RES: <strong style="color:#fb7185">₹{stock['resistance']:.2f}</strong></div>
+                    <div>VWAP: <strong style="color:#00f2fe">₹{stock['vwap']:.2f}</strong></div>
+                    <div>ORB HIGH: <strong style="color:#fbbf24">₹{stock['orb_high']:.2f}</strong></div>
                     <div>ATR(14): <strong>₹{atr_val:.2f}</strong></div>
                 </div>
                 <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom: 12px; padding: 8px 12px; background:rgba(15, 23, 42, 0.7); border:1px solid rgba(255,255,255,0.06); border-radius:6px;">
                     <div>SL PRICE: <strong style="color:#fb7185">₹{sl_price:.2f}</strong></div>
-                    <div>TARGET (1:2): <strong style="color:#34d399">₹{tp_price:.2f}</strong></div>
+                    <div>TARGET (1:3): <strong style="color:#34d399">₹{tp_price:.2f}</strong></div>
                 </div>
                 <div style="font-size:11px; font-weight:700; color:#94a3b8; text-transform:uppercase; margin-bottom:6px; letter-spacing:0.5px;">
                     SCORE: <span style="color:#34d399;">{stock['buy_score']}/10 BUY</span> &nbsp;·&nbsp; <span style="color:#fb7185;">{stock['sell_score']}/10 SELL</span>
@@ -583,7 +658,7 @@ with main_tab_equity:
             </div>
             """, unsafe_allow_html=True)
 
-            # --- DYNAMIC POSITION SIZING & AMOUNT CALCULATION ---
+            # Amount & P&L Sizing Engine
             st.markdown("""
             <div style="margin-top:12px; padding:10px 14px; background:linear-gradient(90deg, rgba(15,23,42,0.8), rgba(30,27,75,0.8)); border:1px solid rgba(255,255,255,0.08); border-radius:6px;">
                 <span style="font-size:13px; font-weight:700; color:#fff;">💰 Amount & P&L Sizing Engine</span>
@@ -607,7 +682,6 @@ with main_tab_equity:
                 with trail_c:
                     in_trail = st.number_input("Trail (₹)", min_value=0.0, value=1.0, step=0.5, key=f"trail_{active_sym}")
 
-                # Payoff Math
                 total_capital_required = trade_qty * trade_limit
                 expected_profit = trade_qty * in_tp_pts
                 expected_loss = trade_qty * in_sl_pts
@@ -830,7 +904,7 @@ with main_tab_fo:
             </div>
             """, unsafe_allow_html=True)
 
-            # Options Position & Payoff Calculator
+            # Options Sizing
             st.markdown(f"""
             <div class="bottom-card" style="margin-top:12px; padding:12px;">
                 <div style="font-size:13px; font-weight:700; color:#fff; margin-bottom:8px;">🎯 Options Position & Payoff Calculator</div>
@@ -850,7 +924,7 @@ with main_tab_fo:
                 est_premium = st.number_input("Option Premium (₹)", min_value=1.0, value=120.0, step=5.0, key=f"prem_{active_fo}")
 
             opt_sl_pts = st.slider("Stop-Loss (Points)", min_value=5, max_value=100, value=25, step=5, key=f"osl_{active_fo}")
-            opt_tp_pts = st.slider("Profit Target (Points)", min_value=10, max_value=250, value=50, step=5, key=f"otp_{active_fo}")
+            opt_tp_pts = st.slider("Profit Target (Points)", min_value=10, max_value=250, value=75, step=5, key=f"otp_{active_fo}")
 
             total_contracts = lots * fo_item['lot']
             total_premium_amount = total_contracts * est_premium
@@ -1001,7 +1075,7 @@ with tab_chart:
         st.plotly_chart(fig_chart, use_container_width=True)
 
 # =========================================================================
-# BOTTOM SECTION: ANGEL ONE GATEWAY (CLEAN & CENTERED)
+# BOTTOM SECTION: ANGEL ONE GATEWAY
 # =========================================================================
 st.write("")
 st.markdown("""
