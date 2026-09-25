@@ -1,5 +1,6 @@
 from datetime import datetime
 import json
+import os
 import urllib.request
 import numpy as np
 import pandas as pd
@@ -51,17 +52,6 @@ st.markdown("""
         margin-bottom: 14px;
         box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
     }
-    .header-left {
-        display: flex;
-        align-items: center;
-        gap: 16px;
-    }
-    .logo-container {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        filter: drop-shadow(0 0 12px rgba(0, 242, 254, 0.45));
-    }
     .brand-title {
         font-size: 28px;
         font-weight: 800;
@@ -82,10 +72,21 @@ st.markdown("""
         font-weight: 600;
         margin-top: 4px;
     }
-    .status-badge {
-        background: linear-gradient(135deg, rgba(16, 185, 129, 0.2), rgba(6, 182, 212, 0.2));
+
+    .mode-badge-paper {
+        background: rgba(245, 158, 11, 0.2);
+        color: #fbbf24;
+        border: 1px solid rgba(245, 158, 11, 0.4);
+        padding: 5px 12px;
+        border-radius: 8px;
+        font-size: 11px;
+        font-weight: 800;
+        font-family: 'JetBrains Mono', monospace;
+    }
+    .mode-badge-live {
+        background: rgba(16, 185, 129, 0.2);
         color: #34d399;
-        border: 1px solid rgba(52, 211, 153, 0.3);
+        border: 1px solid rgba(52, 211, 153, 0.4);
         padding: 5px 12px;
         border-radius: 8px;
         font-size: 11px;
@@ -197,6 +198,112 @@ def apply_chart_style(fig, height=520):
         yaxis=dict(gridcolor="rgba(255,255,255,0.05)", showgrid=True),
     )
     return fig
+
+# --- Persistent Paper Trading Engine ---
+PAPER_FILE = "paper_trades.json"
+
+def load_paper_account():
+    if os.path.exists(PAPER_FILE):
+        try:
+            with open(PAPER_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {
+        "cash": 500000.0,
+        "positions": [],
+        "closed_trades": []
+    }
+
+def save_paper_account(data):
+    try:
+        with open(PAPER_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+if "paper_data" not in st.session_state:
+    st.session_state["paper_data"] = load_paper_account()
+
+def place_paper_order(symbol, action, qty, entry_price, sl_pts, tp_pts, trail_pts=0.0):
+    pdata = st.session_state["paper_data"]
+    sl_price = round(entry_price - sl_pts if action == "BUY" else entry_price + sl_pts, 2)
+    tp_price = round(entry_price + tp_pts if action == "BUY" else entry_price - tp_pts, 2)
+    required_capital = qty * entry_price
+
+    if pdata["cash"] < required_capital and action == "BUY":
+        return False, "Insufficient virtual balance."
+
+    pdata["cash"] -= required_capital
+    position = {
+        "id": f"PAPER-{int(datetime.now().timestamp())}",
+        "symbol": symbol,
+        "action": action,
+        "qty": qty,
+        "entry_price": entry_price,
+        "sl_price": sl_price,
+        "tp_price": tp_price,
+        "sl_pts": sl_pts,
+        "tp_pts": tp_pts,
+        "trail_pts": trail_pts,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "status": "OPEN"
+    }
+    pdata["positions"].append(position)
+    save_paper_account(pdata)
+    return True, f"Paper Order Placed! (ID: {position['id']})"
+
+def evaluate_paper_positions(current_prices):
+    pdata = st.session_state["paper_data"]
+    still_open = []
+    closed_any = False
+
+    for pos in pdata["positions"]:
+        sym = pos["symbol"]
+        if sym not in current_prices:
+            still_open.append(pos)
+            continue
+
+        ltp = current_prices[sym]
+        closed = False
+        exit_price = ltp
+        reason = ""
+
+        if pos["action"] == "BUY":
+            if ltp >= pos["tp_price"]:
+                closed = True
+                exit_price = pos["tp_price"]
+                reason = "Target Hit (1:3)"
+            elif ltp <= pos["sl_price"]:
+                closed = True
+                exit_price = pos["sl_price"]
+                reason = "Stop Loss Hit"
+        else:
+            if ltp <= pos["tp_price"]:
+                closed = True
+                exit_price = pos["tp_price"]
+                reason = "Target Hit (1:3)"
+            elif ltp >= pos["sl_price"]:
+                closed = True
+                exit_price = pos["sl_price"]
+                reason = "Stop Loss Hit"
+
+        if closed:
+            closed_any = True
+            pnl = (exit_price - pos["entry_price"]) * pos["qty"] if pos["action"] == "BUY" else (pos["entry_price"] - exit_price) * pos["qty"]
+            pdata["cash"] += (pos["qty"] * pos["entry_price"]) + pnl
+            pos["status"] = "CLOSED"
+            pos["exit_price"] = exit_price
+            pos["pnl"] = round(pnl, 2)
+            pos["exit_reason"] = reason
+            pos["exit_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            pdata["closed_trades"].append(pos)
+        else:
+            still_open.append(pos)
+
+    if closed_any:
+        pdata["positions"] = still_open
+        save_paper_account(pdata)
 
 # --- Safe Secrets Loader ---
 try:
@@ -339,29 +446,13 @@ HORIZON_MAP = {
     "Long Term (Weekly)": ("5y", "1wk", 10)
 }
 
-# --- Abstract Vector Logo & Header Box ---
-# --- Abstract Vector Logo & Header Box ---
+# --- Header Box ---
 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-SVG_DATA_URL = (
-    "data:image/svg+xml;utf8,"
-    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 716 716' fill='none'>"
-    "<defs><linearGradient id='g' x1='180' y1='180' x2='530' y2='530' gradientUnits='userSpaceOnUse'>"
-    "<stop offset='0%' stop-color='%2300f2fe'/><stop offset='50%' stop-color='%234facfe'/><stop offset='100%' stop-color='%23a855f7'/>"
-    "</linearGradient></defs>"
-    "<path d='M508.749 317.399C516.777 287.314 508.991 253.884 485.389 230.282C461.788 206.681 428.36 198.895 398.273 206.923C376.231 184.928 343.39 174.956 311.148 183.596C278.906 192.234 255.45 217.292 247.36 247.361C217.291 255.451 192.233 278.91 183.595 311.149C174.957 343.391 184.927 376.232 206.924 398.274C198.896 428.359 206.683 461.789 230.284 485.391C253.885 508.992 287.313 516.779 317.401 508.75C339.442 530.745 372.286 540.717 404.525 532.079C436.767 523.441 460.223 498.384 468.313 468.315C498.383 460.224 523.44 436.766 532.078 404.526C540.716 372.285 530.747 339.443 508.749 317.402V317.399ZM470.899 244.776C486.892 260.77 493.488 282.601 490.687 303.412L415.577 260.046C412.411 258.218 408.509 258.218 405.345 260.046L317.401 310.82V277.526C317.401 275.191 318.652 273.005 320.676 271.837L387.644 233.174C414.178 218.353 448.346 222.223 470.901 244.776H470.899ZM357.837 311.144L398.275 334.491V381.185L357.837 404.532L317.398 381.185V334.491L357.837 311.144ZM264.776 269.693C265.207 239.305 285.644 211.649 316.453 203.393C338.3 197.54 360.505 202.744 377.127 215.573L302.014 258.937C298.848 260.764 296.898 264.144 296.898 267.798V369.346L268.065 352.699C266.043 351.531 264.776 349.353 264.776 347.017V269.691V269.693ZM203.391 316.454C209.244 294.608 224.854 277.978 244.276 269.999V356.73C244.276 360.384 246.226 363.763 249.392 365.591L337.337 416.365L308.503 433.013C306.481 434.181 303.961 434.188 301.939 433.02L234.971 394.357C208.868 378.789 195.138 347.261 203.391 316.454ZM244.775 470.9C228.781 454.906 222.186 433.075 224.986 412.264L300.096 455.63C303.263 457.457 307.164 457.457 310.328 455.63L398.273 404.856V438.149C398.273 440.485 397.022 442.671 394.997 443.839L328.029 482.502C301.495 497.322 267.327 493.452 244.772 470.9H244.775ZM450.897 445.982C450.466 476.371 430.029 504.027 399.22 512.283C377.373 518.136 355.168 512.932 338.547 500.102L413.659 456.738C416.826 454.911 418.775 451.532 418.775 447.877V346.329L447.609 362.977C449.631 364.145 450.897 366.323 450.897 368.659V445.985V445.982ZM512.282 399.221C506.429 421.068 490.819 437.697 471.397 445.676V358.946C471.397 355.292 469.448 351.912 466.281 350.085L378.336 299.311L407.17 282.663C409.192 281.495 411.712 281.487 413.734 282.655L480.702 321.318C506.805 336.887 520.536 368.415 512.282 399.221Z' fill='url(%23g)'/>"
-    "</svg>"
-)
-
 st.markdown(f"""<div class="header-box">
-<div class="header-left">
-<div class="logo-container">
-<img src="{SVG_DATA_URL}" width="46" height="46" style="display:block;" />
-</div>
 <div>
 <div class="brand-title">Mahi <span class="brand-accent">Trading</span></div>
 <div class="brand-sub">Multi-Asset Algorithmic Intelligence & Automated Risk Exits</div>
-</div>
 </div>
 <div style="text-align:right;">
 <span class="status-badge">● LIVE MARKET</span>
@@ -371,26 +462,33 @@ st.markdown(f"""<div class="header-box">
 
 angel_tokens = load_angel_token_map()
 
-# --- Dedicated Market Universe Selection Bar ---
+# --- Execution Mode & Universe Selection Bar ---
 st.markdown("""
 <div class="universe-strip">
-    <div style="font-size:11px; font-weight:800; color:#00f2fe; text-transform:uppercase; letter-spacing:1px; margin-bottom:6px;">
-        🌐 Active Market Universe
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+        <span style="font-size:11px; font-weight:800; color:#00f2fe; text-transform:uppercase; letter-spacing:1px;">
+            🌐 Active Market Universe & Execution Mode
+        </span>
     </div>
 </div>
 """, unsafe_allow_html=True)
 
-u_col1, u_col2 = st.columns([6, 6])
+u_col1, u_col2, u_col3 = st.columns([4.5, 4.5, 3])
 with u_col1:
     selected_basket = st.selectbox("Select Asset Universe", list(INDEX_BASKETS.keys()), label_visibility="collapsed")
 with u_col2:
     selected_horizon = st.selectbox("Select Trading Horizon", list(HORIZON_MAP.keys()), label_visibility="collapsed")
+with u_col3:
+    exec_env = st.selectbox("Execution Mode", ["📝 Paper Trading", "⚡ Live Broker"], label_visibility="collapsed")
+
+is_paper_trading = (exec_env == "📝 Paper Trading")
 period, interval, extrema_order = HORIZON_MAP[selected_horizon]
 
 # Main Tabs
-main_tab_equity, main_tab_fo, tab_backtest, tab_chart = st.tabs([
+main_tab_equity, main_tab_fo, tab_paper_ledger, tab_backtest, tab_chart = st.tabs([
     "📈 Equity Intelligence", 
     "🎯 F&O Intelligence (Derivatives)", 
+    "📝 Paper Trading Portfolio",
     "📊 Backtest Engine", 
     "📉 Technical S/R Charts"
 ])
@@ -407,9 +505,11 @@ with main_tab_equity:
     with eq_f3:
         search_query = st.text_input("Search Equity Ticker", placeholder="Search ticker (e.g. RELIANCE, TCS)...")
 
-    st.markdown("""
-    <div class="disclaimer-banner">
-        Algorithmic 10-Point Technical Engine: MTF Daily 50 EMA, Session VWAP, ORB Breakout & Dynamic 1:3 ROBO Risk Exits.
+    mode_label = '<span class="mode-badge-paper">📝 ACTIVE ENVIRONMENT: PAPER TRADING (SIMULATION)</span>' if is_paper_trading else '<span class="mode-badge-live">⚡ ACTIVE ENVIRONMENT: LIVE ANGEL ONE BROKER</span>'
+    st.markdown(f"""
+    <div class="disclaimer-banner" style="display:flex; justify-content:space-between; align-items:center;">
+        <span>Algorithmic 10-Point Technical Engine: MTF Daily 50 EMA, Session VWAP, ORB Breakout & Dynamic 1:3 ROBO Risk Exits.</span>
+        {mode_label}
     </div>
     """, unsafe_allow_html=True)
 
@@ -424,6 +524,7 @@ with main_tab_equity:
 
     rows = []
     checklists = {}
+    current_live_prices = {}
 
     for sym in symbols:
         try:
@@ -479,6 +580,9 @@ with main_tab_equity:
             cur_vol = float(volume.iloc[-1])
             avg_vol_20 = float(volume.iloc[-20:].mean()) if len(volume) >= 20 else cur_vol
 
+            clean_sym = sym.replace(".NS", "").replace(".BO", "")
+            current_live_prices[clean_sym] = c_ltp
+
             # Condition 1: MTF Daily 50 EMA Macro Filter
             c_daily_ema50 = c_ltp
             d_ok = False
@@ -531,7 +635,6 @@ with main_tab_equity:
                 setup = "CONSOLIDATION"
 
             trend_status = "BULLISH (100)" if c_ltp > c_ema50 else "BEARISH (100)"
-            clean_sym = sym.replace(".NS", "").replace(".BO", "")
 
             checklists[clean_sym] = {
                 "sym": sym,
@@ -563,6 +666,9 @@ with main_tab_equity:
             })
         except Exception:
             continue
+
+    # Auto-evaluate open paper positions against current prices
+    evaluate_paper_positions(current_live_prices)
 
     df_results = pd.DataFrame(rows)
 
@@ -705,32 +811,48 @@ with main_tab_equity:
                 """, unsafe_allow_html=True)
 
                 b_col1, b_col2 = st.columns(2)
+                btn_prefix = "📝 PAPER" if is_paper_trading else ""
                 with b_col1:
-                    btn_robo_buy = st.button(f"🟢 BUY ROBO {active_sym}", use_container_width=True, key=f"btn_buy_{active_sym}")
+                    btn_robo_buy = st.button(f"🟢 {btn_prefix} BUY ROBO {active_sym}", use_container_width=True, key=f"btn_buy_{active_sym}")
                 with b_col2:
-                    btn_robo_sell = st.button(f"🔴 SHORT ROBO {active_sym}", use_container_width=True, key=f"btn_sell_{active_sym}")
+                    btn_robo_sell = st.button(f"🔴 {btn_prefix} SHORT ROBO {active_sym}", use_container_width=True, key=f"btn_sell_{active_sym}")
 
-                token = angel_tokens.get(active_sym, "3045")
                 if btn_robo_buy or btn_robo_sell:
-                    if "smart_api" in st.session_state:
-                        action_type = "BUY" if btn_robo_buy else "SELL"
-                        success, resp = place_bracket_robo_order(
-                            smart_api=st.session_state["smart_api"],
+                    action_type = "BUY" if btn_robo_buy else "SELL"
+                    if is_paper_trading:
+                        ok, msg = place_paper_order(
                             symbol=active_sym,
-                            token=token,
+                            action=action_type,
                             qty=trade_qty,
-                            limit_price=trade_limit,
-                            stoploss_pts=in_sl_pts,
-                            target_pts=in_tp_pts,
-                            trailing_pts=in_trail,
-                            action=action_type
+                            entry_price=trade_limit,
+                            sl_pts=in_sl_pts,
+                            tp_pts=in_tp_pts,
+                            trail_pts=in_trail
                         )
-                        if success:
-                            st.success(f"✅ Bracket Order Placed! ID: {resp}")
+                        if ok:
+                            st.success(f"✅ {msg}")
                         else:
-                            st.error(f"Execution Error: {resp}")
+                            st.error(f"❌ {msg}")
                     else:
-                        st.warning("⚠️ Connect Angel One in the gateway below first.")
+                        if "smart_api" in st.session_state:
+                            token = angel_tokens.get(active_sym, "3045")
+                            success, resp = place_bracket_robo_order(
+                                smart_api=st.session_state["smart_api"],
+                                symbol=active_sym,
+                                token=token,
+                                qty=trade_qty,
+                                limit_price=trade_limit,
+                                stoploss_pts=in_sl_pts,
+                                target_pts=in_tp_pts,
+                                trailing_pts=in_trail,
+                                action=action_type
+                            )
+                            if success:
+                                st.success(f"✅ Live Bracket Order Placed! ID: {resp}")
+                            else:
+                                st.error(f"Execution Error: {resp}")
+                        else:
+                            st.warning("⚠️ Connect Angel One in the gateway below first.")
             else:
                 reg_capital = trade_qty * trade_limit
                 st.markdown(f"""
@@ -747,25 +869,33 @@ with main_tab_equity:
                     prod = st.selectbox("Product", ["INTRADAY", "DELIVERY"], key=f"prod_{active_sym}")
                 with reg_c2:
                     st.write("")
-                    btn_reg_buy = st.button(f"⚡ Buy Market {active_sym}", use_container_width=True, key=f"mkt_buy_{active_sym}")
+                    btn_prefix = "📝 PAPER" if is_paper_trading else "⚡"
+                    btn_reg_buy = st.button(f"{btn_prefix} Buy Market {active_sym}", use_container_width=True, key=f"mkt_buy_{active_sym}")
 
                 if btn_reg_buy:
-                    if "smart_api" in st.session_state:
-                        token = angel_tokens.get(active_sym, "3045")
-                        success, resp = place_regular_order(
-                            st.session_state["smart_api"],
-                            symbol=active_sym,
-                            token=token,
-                            qty=trade_qty,
-                            transaction_type="BUY",
-                            product_type=prod
-                        )
-                        if success:
-                            st.success(f"Order Executed! ID: {resp}")
+                    if is_paper_trading:
+                        ok, msg = place_paper_order(active_sym, "BUY", trade_qty, trade_limit, stop_points, target_points)
+                        if ok:
+                            st.success(f"✅ {msg}")
                         else:
-                            st.error(f"Execution Error: {resp}")
+                            st.error(f"❌ {msg}")
                     else:
-                        st.warning("⚠️ Connect Angel One below first.")
+                        if "smart_api" in st.session_state:
+                            token = angel_tokens.get(active_sym, "3045")
+                            success, resp = place_regular_order(
+                                st.session_state["smart_api"],
+                                symbol=active_sym,
+                                token=token,
+                                qty=trade_qty,
+                                transaction_type="BUY",
+                                product_type=prod
+                            )
+                            if success:
+                                st.success(f"Live Market Order Executed! ID: {resp}")
+                            else:
+                                st.error(f"Execution Error: {resp}")
+                        else:
+                            st.warning("⚠️ Connect Angel One below first.")
 
 # =========================================================================
 # TAB 2: F&O INTELLIGENCE (DERIVATIVES ENGINE)
@@ -900,7 +1030,6 @@ with main_tab_fo:
             </div>
             """, unsafe_allow_html=True)
 
-            # Options Sizing
             st.markdown(f"""
             <div class="bottom-card" style="margin-top:12px; padding:12px;">
                 <div style="font-size:13px; font-weight:700; color:#fff; margin-bottom:8px;">🎯 Options Position & Payoff Calculator</div>
@@ -948,17 +1077,105 @@ with main_tab_fo:
             </div>
             """, unsafe_allow_html=True)
 
-            btn_buy_opt = st.button(f"⚡ Dispatch {active_fo} {selected_strike} {opt_type.split()[0]}", use_container_width=True, key=f"btn_opt_{active_fo}")
+            btn_prefix = "📝 PAPER" if is_paper_trading else "⚡"
+            btn_buy_opt = st.button(f"{btn_prefix} Dispatch {active_fo} {selected_strike} {opt_type.split()[0]}", use_container_width=True, key=f"btn_opt_{active_fo}")
 
             if btn_buy_opt:
-                if "smart_api" in st.session_state:
-                    st.info(f"Submitting {active_fo} {selected_strike} {opt_type} | Qty: {total_contracts} (SL: {opt_sl_pts} pts | Target: {opt_tp_pts} pts)...")
-                    st.success(f"Bracket Option Order Dispatched to Angel One! (Qty: {total_contracts})")
+                if is_paper_trading:
+                    opt_sym = f"{active_fo}_{selected_strike}_{opt_type.split()[0]}"
+                    ok, msg = place_paper_order(opt_sym, "BUY", total_contracts, est_premium, opt_sl_pts, opt_tp_pts)
+                    if ok:
+                        st.success(f"✅ Paper Options Position Logged! (Qty: {total_contracts})")
+                    else:
+                        st.error(f"❌ {msg}")
                 else:
-                    st.warning("⚠️ Connect Angel One in the gateway below first.")
+                    if "smart_api" in st.session_state:
+                        st.info(f"Submitting {active_fo} {selected_strike} {opt_type} | Qty: {total_contracts} (SL: {opt_sl_pts} pts | Target: {opt_tp_pts} pts)...")
+                        st.success(f"Bracket Option Order Dispatched to Angel One! (Qty: {total_contracts})")
+                    else:
+                        st.warning("⚠️ Connect Angel One in the gateway below first.")
 
 # =========================================================================
-# TAB 3: BACKTEST ENGINE
+# TAB 3: PAPER TRADING PORTFOLIO & LEDGER DESK
+# =========================================================================
+with tab_paper_ledger:
+    pdata = st.session_state["paper_data"]
+    
+    # Portfolio Balance Metrics
+    total_invested = sum(p["qty"] * p["entry_price"] for p in pdata["positions"])
+    cur_equity = pdata["cash"] + total_invested
+    total_realized_pnl = sum(t["pnl"] for t in pdata["closed_trades"])
+    
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Virtual Cash Balance", f"₹{pdata['cash']:,.2f}")
+    c2.metric("Capital in Active Trades", f"₹{total_invested:,.2f}")
+    c3.metric("Net Virtual Portfolio", f"₹{cur_equity:,.2f}")
+    c4.metric("Total Realized P&L", f"{total_realized_pnl:+,.2f}", delta=f"{((cur_equity-500000)/500000)*100:+.2f}%")
+
+    st.write("")
+    st.markdown("<h4 style='color:#fff; margin-bottom:8px;'>Open Paper Positions (Live Monitoring)</h4>", unsafe_allow_html=True)
+    
+    if pdata["positions"]:
+        open_rows = []
+        for p in pdata["positions"]:
+            sym = p["symbol"]
+            cur_price = current_live_prices.get(sym, p["entry_price"])
+            unrealized = (cur_price - p["entry_price"]) * p["qty"] if p["action"] == "BUY" else (p["entry_price"] - cur_price) * p["qty"]
+            open_rows.append({
+                "ID": p["id"],
+                "Symbol": sym,
+                "Action": p["action"],
+                "Qty": p["qty"],
+                "Entry (₹)": p["entry_price"],
+                "LTP (₹)": cur_price,
+                "SL (₹)": p["sl_price"],
+                "Target (₹)": p["tp_price"],
+                "Unrealized P&L": round(unrealized, 2),
+                "Entered At": p["timestamp"]
+            })
+        st.dataframe(
+            pd.DataFrame(open_rows),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Entry (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                "LTP (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                "SL (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                "Target (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                "Unrealized P&L": st.column_config.NumberColumn(format="%+,.2f"),
+            }
+        )
+    else:
+        st.info("No active paper positions. Place bracket orders from Tab 1 or Tab 2 to start testing.")
+
+    st.write("")
+    st.markdown("<h4 style='color:#fff; margin-bottom:8px;'>Closed Trade History & Performance Journal</h4>", unsafe_allow_html=True)
+    if pdata["closed_trades"]:
+        history_df = pd.DataFrame(pdata["closed_trades"])
+        st.dataframe(
+            history_df[["id", "symbol", "action", "qty", "entry_price", "exit_price", "pnl", "exit_reason", "exit_time"]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "entry_price": st.column_config.NumberColumn(format="₹%.2f"),
+                "exit_price": st.column_config.NumberColumn(format="₹%.2f"),
+                "pnl": st.column_config.NumberColumn(format="%+,.2f"),
+            }
+        )
+    else:
+        st.caption("Closed trades will automatically populate here as Target or Stop-Loss boundaries are triggered.")
+
+    if st.button("🔄 Reset Paper Trading Account to ₹5,00,000"):
+        st.session_state["paper_data"] = {
+            "cash": 500000.0,
+            "positions": [],
+            "closed_trades": []
+        }
+        save_paper_account(st.session_state["paper_data"])
+        st.rerun()
+
+# =========================================================================
+# TAB 4: BACKTEST ENGINE
 # =========================================================================
 with tab_backtest:
     st.markdown("<h3 style='color:#fff; margin-bottom:4px;'>Historical Backtest Engine</h3>", unsafe_allow_html=True)
@@ -1032,7 +1249,7 @@ with tab_backtest:
                 st.warning("Insufficient data available for this asset.")
 
 # =========================================================================
-# TAB 4: S/R CHART ANALYSIS
+# TAB 5: S/R CHART ANALYSIS
 # =========================================================================
 with tab_chart:
     st.markdown("<h3 style='color:#fff; margin-bottom:4px;'>Support & Resistance Extrema Analysis</h3>", unsafe_allow_html=True)
