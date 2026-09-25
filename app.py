@@ -6,7 +6,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.io as pio
 import pyotp
-import requests
 from scipy.signal import argrelextrema
 from SmartApi import SmartConnect
 import streamlit as st
@@ -22,110 +21,137 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# --- Professional Midnight Theme ---
+# --- Professional Dark Abstract Multi-Color Glassmorphic Theme ---
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600;700&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
 
+    /* Abstract Multi-Color Cosmic Dark Mesh Background */
     .stApp {
-        background-color: #080b11;
-        color: #e2e8f0;
-        font-family: 'Inter', -apple-system, sans-serif;
+        background-color: #070913;
+        background-image: 
+            radial-gradient(at 10% 12%, rgba(0, 242, 254, 0.14) 0px, transparent 45%),
+            radial-gradient(at 88% 18%, rgba(139, 92, 246, 0.16) 0px, transparent 50%),
+            radial-gradient(at 52% 85%, rgba(244, 63, 94, 0.12) 0px, transparent 55%),
+            radial-gradient(at 90% 88%, rgba(16, 185, 129, 0.10) 0px, transparent 45%),
+            linear-gradient(180deg, #070913 0%, #0c1022 100%);
+        background-attachment: fixed;
+        color: #f1f5f9;
+        font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
     }
 
+    /* Top Abstract Brand Header */
     .header-box {
         display: flex;
         justify-content: space-between;
         align-items: center;
-        background: linear-gradient(90deg, #0f172a 0%, #080b11 100%);
-        border: 1px solid #1e293b;
-        border-radius: 8px;
-        padding: 14px 20px;
-        margin-bottom: 12px;
+        background: linear-gradient(135deg, rgba(15, 23, 42, 0.85) 0%, rgba(30, 27, 75, 0.6) 50%, rgba(15, 23, 42, 0.85) 100%);
+        backdrop-filter: blur(16px);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 12px;
+        padding: 16px 24px;
+        margin-bottom: 14px;
+        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
     }
     .brand-title {
-        font-size: 26px;
+        font-size: 28px;
         font-weight: 800;
         color: #ffffff;
         letter-spacing: -0.5px;
     }
-    .brand-accent { color: #00f2fe; }
+    .brand-accent {
+        background: linear-gradient(90deg, #00f2fe, #4facfe, #a855f7);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
     .brand-sub {
         font-size: 11px;
-        color: #64748b;
+        color: #94a3b8;
         text-transform: uppercase;
-        letter-spacing: 0.8px;
+        letter-spacing: 1px;
         font-weight: 600;
+        margin-top: 2px;
     }
     .status-badge {
-        background-color: rgba(16, 185, 129, 0.12);
-        color: #10b981;
-        border: 1px solid rgba(16, 185, 129, 0.3);
-        padding: 4px 10px;
-        border-radius: 6px;
+        background: linear-gradient(135deg, rgba(16, 185, 129, 0.2), rgba(6, 182, 212, 0.2));
+        color: #34d399;
+        border: 1px solid rgba(52, 211, 153, 0.3);
+        padding: 5px 12px;
+        border-radius: 8px;
         font-size: 11px;
-        font-weight: 700;
+        font-weight: 800;
         font-family: 'JetBrains Mono', monospace;
     }
 
+    /* Dedicated Universe Selection Strip */
+    .universe-strip {
+        background: linear-gradient(90deg, rgba(15, 23, 42, 0.8) 0%, rgba(20, 20, 45, 0.8) 100%);
+        border: 1px solid rgba(0, 242, 254, 0.2);
+        border-radius: 10px;
+        padding: 12px 18px;
+        margin-bottom: 14px;
+        box-shadow: 0 4px 20px rgba(0, 242, 254, 0.05);
+    }
+
     .disclaimer-banner {
-        border-left: 4px solid #f59e0b;
-        background-color: #0f172a;
-        border-top: 1px solid #1e293b;
-        border-right: 1px solid #1e293b;
-        border-bottom: 1px solid #1e293b;
-        border-radius: 4px;
+        border-left: 4px solid #00f2fe;
+        background: rgba(15, 23, 42, 0.7);
+        border-top: 1px solid rgba(255, 255, 255, 0.05);
+        border-right: 1px solid rgba(255, 255, 255, 0.05);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        border-radius: 6px;
         padding: 8px 14px;
         font-size: 12px;
-        color: #fbbf24;
+        color: #93c5fd;
         margin-bottom: 14px;
     }
 
     .inspector-card {
-        background-color: #0f172a;
-        border: 1px solid #1e293b;
-        border-radius: 8px;
-        padding: 16px;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+        background: linear-gradient(180deg, rgba(15, 23, 42, 0.85) 0%, rgba(20, 25, 45, 0.85) 100%);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 12px;
+        padding: 18px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
     }
     .check-item {
         display: flex;
         justify-content: space-between;
         align-items: center;
-        padding: 6px 0;
-        border-bottom: 1px solid #1e293b;
+        padding: 7px 0;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.04);
         font-size: 12px;
     }
-    .tag-bull { color: #10b981; font-weight: 600; font-family: 'JetBrains Mono', monospace; }
-    .tag-bear { color: #f43f5e; font-weight: 600; font-family: 'JetBrains Mono', monospace; }
+    .tag-bull { color: #34d399; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+    .tag-bear { color: #fb7185; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
 
-    /* Amount Calculation Summary Card */
+    /* Amount Calculation Card */
     .calc-box {
-        background-color: #0b1329;
-        border: 1px solid #1d4ed8;
-        border-radius: 6px;
-        padding: 10px 14px;
+        background: linear-gradient(135deg, rgba(15, 23, 42, 0.9) 0%, rgba(30, 27, 75, 0.7) 100%);
+        border: 1px solid rgba(99, 102, 241, 0.3);
+        border-radius: 8px;
+        padding: 12px 16px;
         margin: 10px 0;
         font-size: 12px;
     }
     .calc-row {
         display: flex;
         justify-content: space-between;
-        padding: 3px 0;
+        align-items: center;
+        padding: 4px 0;
     }
 
     .bottom-card {
-        background-color: #0f172a;
-        border: 1px solid #1e293b;
-        border-radius: 8px;
-        padding: 16px;
-        margin-top: 18px;
+        background: linear-gradient(135deg, rgba(15, 23, 42, 0.8) 0%, rgba(20, 20, 45, 0.8) 100%);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 10px;
+        padding: 18px;
+        margin-top: 20px;
     }
     .bottom-title {
-        font-size: 14px;
+        font-size: 15px;
         font-weight: 700;
         color: #f8fafc;
-        margin-bottom: 10px;
+        margin-bottom: 12px;
         display: flex;
         align-items: center;
         gap: 6px;
@@ -133,20 +159,20 @@ st.markdown("""
 
     .stTabs [data-baseweb="tab-list"] {
         gap: 8px;
-        border-bottom: 1px solid #1e293b;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
     }
     .stTabs [data-baseweb="tab"] {
-        background-color: #0f172a;
-        border: 1px solid #1e293b;
-        border-radius: 6px 6px 0 0;
+        background-color: rgba(15, 23, 42, 0.7);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        border-radius: 8px 8px 0 0;
         color: #94a3b8;
-        padding: 8px 20px;
+        padding: 8px 22px;
         font-weight: 600;
     }
     .stTabs [aria-selected="true"] {
-        background-color: #1e293b !important;
+        background: linear-gradient(180deg, rgba(30, 41, 59, 0.9) 0%, rgba(15, 23, 42, 0.9) 100%) !important;
         color: #00f2fe !important;
-        font-weight: 700;
+        font-weight: 800;
         border-bottom: 2px solid #00f2fe;
     }
 </style>
@@ -154,15 +180,26 @@ st.markdown("""
 
 def apply_chart_style(fig, height=520):
     fig.update_layout(
-        paper_bgcolor="#080b11",
-        plot_bgcolor="#0f172a",
-        font=dict(color="#94a3b8", family="Inter"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(15, 23, 42, 0.5)",
+        font=dict(color="#94a3b8", family="Plus Jakarta Sans"),
         height=height,
         margin=dict(l=20, r=20, t=30, b=20),
-        xaxis=dict(gridcolor="#1e293b", showgrid=True),
-        yaxis=dict(gridcolor="#1e293b", showgrid=True),
+        xaxis=dict(gridcolor="rgba(255,255,255,0.05)", showgrid=True),
+        yaxis=dict(gridcolor="rgba(255,255,255,0.05)", showgrid=True),
     )
     return fig
+
+# --- Safe Secrets Loader ---
+try:
+    sec_angel = st.secrets.get("angel_one", {})
+except Exception:
+    sec_angel = {}
+
+def_api_key = sec_angel.get("api_key", "")
+def_client_id = sec_angel.get("client_id", "")
+def_pin = sec_angel.get("mpin", "")
+def_totp = sec_angel.get("totp_secret", "")
 
 # --- Angel One SmartAPI Utilities ---
 @st.cache_data(ttl=86400)
@@ -195,6 +232,12 @@ def connect_angel_one(api_key: str, client_code: str, pin: str, totp_secret: str
         return None, session_data.get('message', 'Login failed')
     except Exception as e:
         return None, str(e)
+
+# Auto-connect if secrets are available
+if "smart_api" not in st.session_state and all([def_api_key, def_client_id, def_pin, def_totp]):
+    api_instance, _ = connect_angel_one(def_api_key, def_client_id, def_pin, def_totp)
+    if api_instance:
+        st.session_state["smart_api"] = api_instance
 
 def place_bracket_robo_order(smart_api, symbol: str, token: str, qty: int, limit_price: float, stoploss_pts: float, target_pts: float, trailing_pts: float = 0.0, action: str = "BUY"):
     try:
@@ -238,15 +281,6 @@ def place_regular_order(smart_api, symbol: str, token: str, qty: int, transactio
         return True, order_id
     except Exception as e:
         return False, str(e)
-
-def send_telegram_alert(token: str, chat_id: str, message: str) -> bool:
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
-    try:
-        res = requests.post(url, json=payload, timeout=5)
-        return res.status_code == 200
-    except Exception:
-        return False
 
 # --- Basket Universes ---
 INDEX_BASKETS = {
@@ -304,18 +338,34 @@ st.markdown(f"""
 <div class="header-box">
     <div>
         <div class="brand-title">Mahi <span class="brand-accent">Trading</span></div>
-        <div class="brand-sub">Multi-Asset Intelligence: Cash Equities & Derivatives</div>
+        <div class="brand-sub">Multi-Asset Algorithmic Intelligence & Automated Risk Exits</div>
     </div>
-    <div>
-        <span class="status-badge">● LIVE MARKET</span> &nbsp;
-        <span style="font-size:12px; color:#94a3b8;">{timestamp} IST</span>
+    <div style="text-align:right;">
+        <span class="status-badge">● LIVE MARKET</span>
+        <div style="font-size:12px; color:#94a3b8; margin-top:4px;">{timestamp} IST</div>
     </div>
 </div>
 """, unsafe_allow_html=True)
 
 angel_tokens = load_angel_token_map()
 
-# Top Navigation Tabs
+# --- Dedicated Market Universe Selection Bar ---
+st.markdown("""
+<div class="universe-strip">
+    <div style="font-size:11px; font-weight:800; color:#00f2fe; text-transform:uppercase; letter-spacing:1px; margin-bottom:6px;">
+        🌐 Active Market Universe
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+u_col1, u_col2 = st.columns([6, 6])
+with u_col1:
+    selected_basket = st.selectbox("Select Asset Universe", list(INDEX_BASKETS.keys()), label_visibility="collapsed")
+with u_col2:
+    selected_horizon = st.selectbox("Select Trading Horizon", list(HORIZON_MAP.keys()), label_visibility="collapsed")
+period, interval, extrema_order = HORIZON_MAP[selected_horizon]
+
+# Main Tabs
 main_tab_equity, main_tab_fo, tab_backtest, tab_chart = st.tabs([
     "📈 Equity Intelligence", 
     "🎯 F&O Intelligence (Derivatives)", 
@@ -327,21 +377,17 @@ main_tab_equity, main_tab_fo, tab_backtest, tab_chart = st.tabs([
 # TAB 1: EQUITY INTELLIGENCE + AMOUNT & P&L CALCULATOR
 # =========================================================================
 with main_tab_equity:
-    st.markdown("""<div style="font-size:13px; font-weight:700; color:#f8fafc; margin-bottom:6px;">⚡ EQUITY SETTINGS</div>""", unsafe_allow_html=True)
-    eq_c1, eq_c2, eq_c3, eq_c4 = st.columns([2.5, 2.5, 2.5, 2.5])
-    with eq_c1:
-        selected_basket = st.selectbox("Market Universe", list(INDEX_BASKETS.keys()), key="eq_basket")
-    with eq_c2:
-        selected_horizon = st.selectbox("Trading Horizon", list(HORIZON_MAP.keys()), key="eq_horizon")
-    period, interval, extrema_order = HORIZON_MAP[selected_horizon]
-    with eq_c3:
-        setup_filter = st.selectbox("Filter Setup", ["All setups", "BUY_SETUP", "BEARISH_SETUP", "REVERSAL_WATCH", "CONSOLIDATION"], key="eq_setup")
-    with eq_c4:
-        trend_filter = st.selectbox("Filter Trend", ["All trends", "BULLISH", "BEARISH"], key="eq_trend")
+    eq_f1, eq_f2, eq_f3 = st.columns([3, 3, 4])
+    with eq_f1:
+        setup_filter = st.selectbox("Setup Filter", ["All setups", "BUY_SETUP", "BEARISH_SETUP", "REVERSAL_WATCH", "CONSOLIDATION"])
+    with eq_f2:
+        trend_filter = st.selectbox("Trend Filter", ["All trends", "BULLISH", "BEARISH"])
+    with eq_f3:
+        search_query = st.text_input("Search Equity Ticker", placeholder="Search ticker (e.g. RELIANCE, TCS)...")
 
     st.markdown("""
     <div class="disclaimer-banner">
-        Cash Market Screener: Algorithmic 10-point checklist, Position Sizing & Real-time Profit/Loss Calculators.
+        Cash Market Screener: Algorithmic 10-point checklist, dynamic position sizing & real-time capital payoff.
     </div>
     """, unsafe_allow_html=True)
 
@@ -453,10 +499,6 @@ with main_tab_equity:
 
     df_results = pd.DataFrame(rows)
 
-    eq_search_col, _ = st.columns([4, 6])
-    with eq_search_col:
-        search_query = st.text_input("Search Equity Ticker", placeholder="Search ticker (e.g. RELIANCE, TCS)...", label_visibility="collapsed")
-
     filtered_df = df_results.copy()
     if setup_filter != "All setups":
         filtered_df = filtered_df[filtered_df['Setup'] == setup_filter]
@@ -497,7 +539,7 @@ with main_tab_equity:
 
         if active_sym and active_sym in checklists:
             stock = checklists[active_sym]
-            chg_c = "#10b981" if stock['chg'] >= 0 else "#f43f5e"
+            chg_c = "#34d399" if stock['chg'] >= 0 else "#fb7185"
 
             atr_val = stock['atr']
             stop_points = round(float(1.5 * atr_val), 1)
@@ -521,57 +563,56 @@ with main_tab_equity:
                             ₹{stock['ltp']:.2f} <span style="font-size:13px; color:{chg_c}">({stock['chg']:+.2f}%)</span>
                         </div>
                     </div>
-                    <span style="background-color:rgba(0, 242, 254, 0.1); border:1px solid rgba(0, 242, 254, 0.3); color:#00f2fe; font-size:11px; padding:3px 8px; border-radius:4px; font-weight:700;">
+                    <span style="background:rgba(0, 242, 254, 0.12); border:1px solid rgba(0, 242, 254, 0.3); color:#00f2fe; font-size:11px; padding:3px 8px; border-radius:6px; font-weight:700;">
                         {stock['setup']}
                     </span>
                 </div>
-                <div style="display:flex; justify-content:space-between; font-size:12px; margin: 10px 0; padding: 8px 12px; background-color:#1e293b; border-radius:6px;">
-                    <div>SUP: <strong style="color:#10b981">₹{stock['support']:.2f}</strong></div>
-                    <div>RES: <strong style="color:#f43f5e">₹{stock['resistance']:.2f}</strong></div>
+                <div style="display:flex; justify-content:space-between; font-size:12px; margin: 10px 0; padding: 8px 12px; background:rgba(30, 41, 59, 0.6); border-radius:6px;">
+                    <div>SUP: <strong style="color:#34d399">₹{stock['support']:.2f}</strong></div>
+                    <div>RES: <strong style="color:#fb7185">₹{stock['resistance']:.2f}</strong></div>
                     <div>ATR(14): <strong>₹{atr_val:.2f}</strong></div>
                 </div>
-                <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom: 12px; padding: 8px 12px; background-color:#162032; border:1px solid #1e293b; border-radius:6px;">
-                    <div>SL PRICE: <strong style="color:#f43f5e">₹{sl_price:.2f}</strong></div>
-                    <div>TARGET (1:2): <strong style="color:#10b981">₹{tp_price:.2f}</strong></div>
+                <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom: 12px; padding: 8px 12px; background:rgba(15, 23, 42, 0.7); border:1px solid rgba(255,255,255,0.06); border-radius:6px;">
+                    <div>SL PRICE: <strong style="color:#fb7185">₹{sl_price:.2f}</strong></div>
+                    <div>TARGET (1:2): <strong style="color:#34d399">₹{tp_price:.2f}</strong></div>
                 </div>
                 <div style="font-size:11px; font-weight:700; color:#94a3b8; text-transform:uppercase; margin-bottom:6px; letter-spacing:0.5px;">
-                    SCORE: <span style="color:#10b981;">{stock['buy_score']}/10 BUY</span> &nbsp;·&nbsp; <span style="color:#f43f5e;">{stock['sell_score']}/10 SELL</span>
+                    SCORE: <span style="color:#34d399;">{stock['buy_score']}/10 BUY</span> &nbsp;·&nbsp; <span style="color:#fb7185;">{stock['sell_score']}/10 SELL</span>
                 </div>
                 {items_html}
             </div>
             """, unsafe_allow_html=True)
 
-            # --- SIZING & PROFIT / LOSS CALCULATOR BOX ---
+            # --- DYNAMIC POSITION SIZING & AMOUNT CALCULATION ---
             st.markdown("""
-            <div style="margin-top:12px; padding:10px 14px; background-color:#162032; border:1px solid #1e293b; border-radius:6px;">
+            <div style="margin-top:12px; padding:10px 14px; background:linear-gradient(90deg, rgba(15,23,42,0.8), rgba(30,27,75,0.8)); border:1px solid rgba(255,255,255,0.08); border-radius:6px;">
                 <span style="font-size:13px; font-weight:700; color:#fff;">💰 Amount & P&L Sizing Engine</span>
             </div>
             """, unsafe_allow_html=True)
 
-            order_mode = st.radio("Order Type", ["Bracket (ROBO Auto-Exit)", "Regular Market"], horizontal=True, label_visibility="collapsed", key="eq_ord_mode")
+            order_mode = st.radio("Order Type", ["Bracket (ROBO Auto-Exit)", "Regular Market"], horizontal=True, label_visibility="collapsed", key=f"mode_{active_sym}")
             
             calc_c1, calc_c2 = st.columns(2)
             with calc_c1:
-                trade_qty = st.number_input("Shares Qty to Buy", min_value=1, value=10, step=1, key="eq_qty")
+                trade_qty = st.number_input("Shares Qty to Buy", min_value=1, value=10, step=1, key=f"qty_{active_sym}")
             with calc_c2:
-                trade_limit = st.number_input("Entry Price (₹)", value=float(round(stock['ltp'], 2)), step=0.5, key="eq_limit")
+                trade_limit = st.number_input("Entry Price (₹)", value=float(round(stock['ltp'], 2)), step=0.5, key=f"limit_{active_sym}")
 
             if order_mode == "Bracket (ROBO Auto-Exit)":
                 sl_c, tp_c, trail_c = st.columns(3)
                 with sl_c:
-                    in_sl_pts = st.number_input("SL Points (₹)", min_value=0.5, value=float(stop_points), step=0.5, key="eq_sl")
+                    in_sl_pts = st.number_input("SL Points (₹)", min_value=0.5, value=float(stop_points), step=0.5, key=f"sl_{active_sym}")
                 with tp_c:
-                    in_tp_pts = st.number_input("Target Points (₹)", min_value=1.0, value=float(target_points), step=0.5, key="eq_tp")
+                    in_tp_pts = st.number_input("Target Points (₹)", min_value=1.0, value=float(target_points), step=0.5, key=f"tp_{active_sym}")
                 with trail_c:
-                    in_trail = st.number_input("Trail (₹)", min_value=0.0, value=1.0, step=0.5, key="eq_trail")
+                    in_trail = st.number_input("Trail (₹)", min_value=0.0, value=1.0, step=0.5, key=f"trail_{active_sym}")
 
-                # Calculations for Amount & Expected Profit / Loss
+                # Payoff Math
                 total_capital_required = trade_qty * trade_limit
                 expected_profit = trade_qty * in_tp_pts
                 expected_loss = trade_qty * in_sl_pts
                 reward_risk_ratio = round(expected_profit / expected_loss, 2) if expected_loss > 0 else 0.0
 
-                # Formatted Card Output
                 st.markdown(f"""
                 <div class="calc-box">
                     <div class="calc-row">
@@ -580,13 +621,13 @@ with main_tab_equity:
                     </div>
                     <div class="calc-row">
                         <span style="color:#94a3b8;">Expected Max Profit (Target):</span>
-                        <strong style="color:#10b981; font-size:14px;">+₹{expected_profit:,.2f}</strong>
+                        <strong style="color:#34d399; font-size:14px;">+₹{expected_profit:,.2f}</strong>
                     </div>
                     <div class="calc-row">
                         <span style="color:#94a3b8;">Expected Max Loss (Stop-Loss):</span>
-                        <strong style="color:#f43f5e; font-size:14px;">-₹{expected_loss:,.2f}</strong>
+                        <strong style="color:#fb7185; font-size:14px;">-₹{expected_loss:,.2f}</strong>
                     </div>
-                    <div class="calc-row" style="border-top:1px solid #1e293b; margin-top:4px; padding-top:4px;">
+                    <div class="calc-row" style="border-top:1px solid rgba(255,255,255,0.06); margin-top:4px; padding-top:4px;">
                         <span style="color:#94a3b8;">Net Risk-to-Reward Ratio:</span>
                         <strong style="color:#00f2fe;">1 : {reward_risk_ratio}</strong>
                     </div>
@@ -595,9 +636,9 @@ with main_tab_equity:
 
                 b_col1, b_col2 = st.columns(2)
                 with b_col1:
-                    btn_robo_buy = st.button(f"🟢 BUY ROBO {active_sym}", use_container_width=True, key="eq_btn_buy")
+                    btn_robo_buy = st.button(f"🟢 BUY ROBO {active_sym}", use_container_width=True, key=f"btn_buy_{active_sym}")
                 with b_col2:
-                    btn_robo_sell = st.button(f"🔴 SHORT ROBO {active_sym}", use_container_width=True, key="eq_btn_sell")
+                    btn_robo_sell = st.button(f"🔴 SHORT ROBO {active_sym}", use_container_width=True, key=f"btn_sell_{active_sym}")
 
                 token = angel_tokens.get(active_sym, "3045")
                 if btn_robo_buy or btn_robo_sell:
@@ -619,7 +660,7 @@ with main_tab_equity:
                         else:
                             st.error(f"Execution Error: {resp}")
                     else:
-                        st.warning("⚠️ Connect Angel One below first.")
+                        st.warning("⚠️ Connect Angel One in the gateway below first.")
             else:
                 reg_capital = trade_qty * trade_limit
                 st.markdown(f"""
@@ -633,10 +674,10 @@ with main_tab_equity:
 
                 reg_c1, reg_c2 = st.columns(2)
                 with reg_c1:
-                    prod = st.selectbox("Product", ["INTRADAY", "DELIVERY"], key="eq_prod")
+                    prod = st.selectbox("Product", ["INTRADAY", "DELIVERY"], key=f"prod_{active_sym}")
                 with reg_c2:
                     st.write("")
-                    btn_reg_buy = st.button(f"⚡ Buy Market {active_sym}", use_container_width=True, key="eq_mkt_buy")
+                    btn_reg_buy = st.button(f"⚡ Buy Market {active_sym}", use_container_width=True, key=f"mkt_buy_{active_sym}")
 
                 if btn_reg_buy:
                     if "smart_api" in st.session_state:
@@ -657,10 +698,9 @@ with main_tab_equity:
                         st.warning("⚠️ Connect Angel One below first.")
 
 # =========================================================================
-# TAB 2: F&O INTELLIGENCE + OPTIONS AMOUNT SIZING
+# TAB 2: F&O INTELLIGENCE (DERIVATIVES ENGINE)
 # =========================================================================
 with main_tab_fo:
-    st.markdown("""<div style="font-size:13px; font-weight:700; color:#f8fafc; margin-bottom:6px;">🎯 F&O DERIVATIVES COCKPIT</div>""", unsafe_allow_html=True)
     st.markdown("""
     <div class="disclaimer-banner">
         Futures Open Interest (OI) Buildup, PCR Sentiment & Options Capital / P&L Calculators.
@@ -689,10 +729,10 @@ with main_tab_fo:
 
             if f_chg > 0 and vol_chg > 0:
                 buildup = "LONG BUILDUP"
-                buildup_color = "#10b981"
+                buildup_color = "#34d399"
             elif f_chg < 0 and vol_chg > 0:
                 buildup = "SHORT BUILDUP"
-                buildup_color = "#f43f5e"
+                buildup_color = "#fb7185"
             elif f_chg > 0 and vol_chg < 0:
                 buildup = "SHORT COVERING"
                 buildup_color = "#38bdf8"
@@ -762,7 +802,7 @@ with main_tab_fo:
 
         if active_fo in fo_details:
             fo_item = fo_details[active_fo]
-            fo_chg_c = "#10b981" if fo_item['chg'] >= 0 else "#f43f5e"
+            fo_chg_c = "#34d399" if fo_item['chg'] >= 0 else "#fb7185"
 
             st.markdown(f"""
             <div class="inspector-card">
@@ -773,16 +813,16 @@ with main_tab_fo:
                             ₹{fo_item['ltp']:.2f} <span style="font-size:13px; color:{fo_chg_c}">({fo_item['chg']:+.2f}%)</span>
                         </div>
                     </div>
-                    <span style="background-color:rgba(0, 242, 254, 0.1); border:1px solid rgba(0, 242, 254, 0.3); color:{fo_item['buildup_color']}; font-size:11px; padding:4px 8px; border-radius:4px; font-weight:700;">
+                    <span style="background:rgba(0, 242, 254, 0.12); border:1px solid rgba(0, 242, 254, 0.3); color:{fo_item['buildup_color']}; font-size:11px; padding:4px 8px; border-radius:6px; font-weight:700;">
                         {fo_item['buildup']}
                     </span>
                 </div>
-                <div style="display:flex; justify-content:space-between; font-size:12px; margin: 10px 0; padding: 8px 12px; background-color:#1e293b; border-radius:6px;">
+                <div style="display:flex; justify-content:space-between; font-size:12px; margin: 10px 0; padding: 8px 12px; background:rgba(30, 41, 59, 0.6); border-radius:6px;">
                     <div>PCR: <strong style="color:#00f2fe;">{fo_item['pcr']}</strong></div>
                     <div>SENTIMENT: <strong>{fo_item['pcr_sentiment']}</strong></div>
                     <div>LOT SIZE: <strong>{fo_item['lot']}</strong></div>
                 </div>
-                <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom: 12px; padding: 8px 12px; background-color:#162032; border:1px solid #1e293b; border-radius:6px;">
+                <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom: 12px; padding: 8px 12px; background:rgba(15, 23, 42, 0.7); border:1px solid rgba(255,255,255,0.06); border-radius:6px;">
                     <div>ATM STRIKE: <strong style="color:#fbbf24;">{fo_item['atm_strike']}</strong></div>
                     <div>CE OTM: <strong>{fo_item['atm_strike'] + fo_item['step']}</strong></div>
                     <div>PE OTM: <strong>{fo_item['atm_strike'] - fo_item['step']}</strong></div>
@@ -790,7 +830,7 @@ with main_tab_fo:
             </div>
             """, unsafe_allow_html=True)
 
-            # Options Amount & P&L Calculator
+            # Options Position & Payoff Calculator
             st.markdown(f"""
             <div class="bottom-card" style="margin-top:12px; padding:12px;">
                 <div style="font-size:13px; font-weight:700; color:#fff; margin-bottom:8px;">🎯 Options Position & Payoff Calculator</div>
@@ -799,20 +839,19 @@ with main_tab_fo:
 
             opt_c1, opt_c2 = st.columns(2)
             with opt_c1:
-                opt_type = st.selectbox("Option Type", ["CALL (CE)", "PUT (PE)"])
+                opt_type = st.selectbox("Option Type", ["CALL (CE)", "PUT (PE)"], key=f"opt_type_{active_fo}")
             with opt_c2:
-                selected_strike = st.number_input("Strike Price", value=fo_item['atm_strike'], step=fo_item['step'])
+                selected_strike = st.number_input("Strike Price", value=fo_item['atm_strike'], step=fo_item['step'], key=f"strike_{active_fo}")
 
             opt_q1, opt_q2 = st.columns(2)
             with opt_q1:
-                lots = st.number_input("Number of Lots", min_value=1, value=1, step=1)
+                lots = st.number_input("Number of Lots", min_value=1, value=1, step=1, key=f"lots_{active_fo}")
             with opt_q2:
-                est_premium = st.number_input("Option Premium (₹)", min_value=1.0, value=120.0, step=5.0)
+                est_premium = st.number_input("Option Premium (₹)", min_value=1.0, value=120.0, step=5.0, key=f"prem_{active_fo}")
 
-            opt_sl_pts = st.slider("Stop-Loss (Points)", min_value=5, max_value=100, value=25, step=5)
-            opt_tp_pts = st.slider("Profit Target (Points)", min_value=10, max_value=250, value=50, step=5)
+            opt_sl_pts = st.slider("Stop-Loss (Points)", min_value=5, max_value=100, value=25, step=5, key=f"osl_{active_fo}")
+            opt_tp_pts = st.slider("Profit Target (Points)", min_value=10, max_value=250, value=50, step=5, key=f"otp_{active_fo}")
 
-            # Derivative Payoff Math
             total_contracts = lots * fo_item['lot']
             total_premium_amount = total_contracts * est_premium
             opt_profit = total_contracts * opt_tp_pts
@@ -830,16 +869,16 @@ with main_tab_fo:
                 </div>
                 <div class="calc-row">
                     <span style="color:#94a3b8;">Estimated Profit on Target (+{opt_tp_pts} pts):</span>
-                    <strong style="color:#10b981; font-size:14px;">+₹{opt_profit:,.2f}</strong>
+                    <strong style="color:#34d399; font-size:14px;">+₹{opt_profit:,.2f}</strong>
                 </div>
                 <div class="calc-row">
                     <span style="color:#94a3b8;">Estimated Loss on SL (-{opt_sl_pts} pts):</span>
-                    <strong style="color:#f43f5e; font-size:14px;">-₹{opt_loss:,.2f}</strong>
+                    <strong style="color:#fb7185; font-size:14px;">-₹{opt_loss:,.2f}</strong>
                 </div>
             </div>
             """, unsafe_allow_html=True)
 
-            btn_buy_opt = st.button(f"⚡ Dispatch {active_fo} {selected_strike} {opt_type.split()[0]}", use_container_width=True)
+            btn_buy_opt = st.button(f"⚡ Dispatch {active_fo} {selected_strike} {opt_type.split()[0]}", use_container_width=True, key=f"btn_opt_{active_fo}")
 
             if btn_buy_opt:
                 if "smart_api" in st.session_state:
@@ -916,7 +955,7 @@ with tab_backtest:
                 m4.metric("Max Drawdown", f"{max_dd:.2f}%")
 
                 fig_bt = go.Figure()
-                fig_bt.add_trace(go.Scatter(x=raw.index, y=raw['Portfolio_Val'], mode='lines', line=dict(color='#10b981', width=2), name="Equity"))
+                fig_bt.add_trace(go.Scatter(x=raw.index, y=raw['Portfolio_Val'], mode='lines', line=dict(color='#34d399', width=2), name="Equity"))
                 fig_bt = apply_chart_style(fig_bt, height=380)
                 st.plotly_chart(fig_bt, use_container_width=True)
             else:
@@ -948,13 +987,13 @@ with tab_chart:
         fig_chart = go.Figure()
         fig_chart.add_trace(go.Candlestick(
             x=c_raw.index, open=c_raw['Open'], high=c_raw['High'], low=c_raw['Low'], close=c_raw['Close'], name="Price",
-            increasing_line_color="#10b981", decreasing_line_color="#f43f5e"
+            increasing_line_color="#34d399", decreasing_line_color="#fb7185"
         ))
         fig_chart.add_trace(go.Scatter(
-            x=c_raw.index, y=c_raw['Nearest_Res'], mode='lines', line_shape='hv', line=dict(color='#f43f5e', dash='dash', width=1.5), name='Resistance'
+            x=c_raw.index, y=c_raw['Nearest_Res'], mode='lines', line_shape='hv', line=dict(color='#fb7185', dash='dash', width=1.5), name='Resistance'
         ))
         fig_chart.add_trace(go.Scatter(
-            x=c_raw.index, y=c_raw['Nearest_Sup'], mode='lines', line_shape='hv', line=dict(color='#10b981', dash='dash', width=1.5), name='Support'
+            x=c_raw.index, y=c_raw['Nearest_Sup'], mode='lines', line_shape='hv', line=dict(color='#34d399', dash='dash', width=1.5), name='Support'
         ))
 
         fig_chart = apply_chart_style(fig_chart, height=550)
@@ -962,78 +1001,37 @@ with tab_chart:
         st.plotly_chart(fig_chart, use_container_width=True)
 
 # =========================================================================
-# BOTTOM SECTION: ANGEL ONE & TELEGRAM CARDS
+# BOTTOM SECTION: ANGEL ONE GATEWAY (CLEAN & CENTERED)
 # =========================================================================
 st.write("")
-bot_col1, bot_col2 = st.columns(2)
+st.markdown("""
+<div class="bottom-card">
+    <div class="bottom-title">🔗 Angel One SmartAPI Gateway</div>
+</div>
+""", unsafe_allow_html=True)
 
-with bot_col1:
-    st.markdown("""
-    <div class="bottom-card">
-        <div class="bottom-title">🔗 Angel One SmartAPI Gateway</div>
-    </div>
-    """, unsafe_allow_html=True)
+ao_c1, ao_c2 = st.columns(2)
+with ao_c1:
+    ao_api_key = st.text_input("API Key", value=def_api_key, type="password", placeholder="API Key")
+    ao_client = st.text_input("Client ID", value=def_client_id, placeholder="Client Code")
+with ao_c2:
+    ao_pin = st.text_input("MPIN", value=def_pin, type="password", placeholder="MPIN")
+    ao_totp_key = st.text_input("TOTP Secret Key", value=def_totp, type="password", placeholder="Secret Key")
 
-    ao_c1, ao_c2 = st.columns(2)
-    with ao_c1:
-        ao_api_key = st.text_input("API Key", type="password", placeholder="API Key")
-        ao_client = st.text_input("Client ID", placeholder="Client Code")
-    with ao_c2:
-        ao_pin = st.text_input("MPIN", type="password", placeholder="MPIN")
-        ao_totp_key = st.text_input("TOTP Secret Key", type="password", placeholder="Secret Key")
-
-    ao_btn_col, ao_status_col = st.columns([1.5, 2.5])
-    with ao_btn_col:
-        if st.button("Connect Broker", use_container_width=True):
-            if all([ao_api_key, ao_client, ao_pin, ao_totp_key]):
-                api_obj, res_msg = connect_angel_one(ao_api_key, ao_client, ao_pin, ao_totp_key)
-                if api_obj:
-                    st.session_state["smart_api"] = api_obj
-                    st.success("Connected!")
-                else:
-                    st.error(f"Failed: {res_msg}")
+ao_btn_col, ao_status_col = st.columns([1.5, 2.5])
+with ao_btn_col:
+    if st.button("Connect Broker", use_container_width=True):
+        if all([ao_api_key, ao_client, ao_pin, ao_totp_key]):
+            api_obj, res_msg = connect_angel_one(ao_api_key, ao_client, ao_pin, ao_totp_key)
+            if api_obj:
+                st.session_state["smart_api"] = api_obj
+                st.success("Connected!")
             else:
-                st.warning("Fill in all credentials.")
-    with ao_status_col:
-        if "smart_api" in st.session_state:
-            st.markdown("<span style='color:#10b981; font-size:13px; font-weight:700; line-height:38px;'>● SESSION ACTIVE & READY</span>", unsafe_allow_html=True)
+                st.error(f"Failed: {res_msg}")
         else:
-            st.markdown("<span style='color:#64748b; font-size:13px; font-weight:500; line-height:38px;'>Status: Disconnected</span>", unsafe_allow_html=True)
-
-with bot_col2:
-    st.markdown("""
-    <div class="bottom-card">
-        <div class="bottom-title">🔔 Telegram Broadcast Center</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    tg_c1, tg_c2 = st.columns(2)
-    with tg_c1:
-        tg_token = st.text_input("Telegram Bot Token", type="password", placeholder="Bot Token")
-    with tg_c2:
-        tg_chat_id = st.text_input("Telegram Chat ID", placeholder="Chat ID")
-
-    if st.button("🚀 Broadcast High-Confidence Setups (Score ≥ 8/10)", use_container_width=True):
-        if not tg_token or not tg_chat_id:
-            st.error("Provide Bot Token and Chat ID.")
-        else:
-            alert_candidates = [info for s, info in checklists.items() if info['buy_score'] >= 8 or info['sell_score'] >= 8]
-            if alert_candidates:
-                for item in alert_candidates:
-                    alert_type = "🟢 *BUY BREAKOUT*" if item['buy_score'] >= 8 else "🔴 *BEARISH BREAKDOWN*"
-                    msg = (
-                        f"⚡ *Mahi Trading Alert*\n"
-                        f"{alert_type}\n\n"
-                        f"📌 *Asset:* `{item['sym']}`\n"
-                        f"💰 *LTP:* ₹{item['ltp']:.2f} ({item['chg']:+.2f}%)\n"
-                        f"🎯 *Setup:* `{item['setup']}`\n"
-                        f"📊 *Score:* {item['buy_score']}/10 Buy · {item['sell_score']}/10 Sell\n"
-                        f"🛡️ *Support:* ₹{item['support']:.2f}\n"
-                        f"🚧 *Resistance:* ₹{item['resistance']:.2f}\n"
-                        f"📈 *RSI:* {item['rsi']:.1f}\n\n"
-                        f"⏰ _{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST_"
-                    )
-                    send_telegram_alert(tg_token, tg_chat_id, msg)
-                st.success(f"Dispatched {len(alert_candidates)} alert(s) to Telegram!")
-            else:
-                st.info("No setups currently meet the 8/10 threshold.")
+            st.warning("Fill in all credentials.")
+with ao_status_col:
+    if "smart_api" in st.session_state:
+        st.markdown("<span style='color:#34d399; font-size:13px; font-weight:700; line-height:38px;'>● SESSION ACTIVE & READY</span>", unsafe_allow_html=True)
+    else:
+        st.markdown("<span style='color:#94a3b8; font-size:13px; font-weight:500; line-height:38px;'>Status: Disconnected</span>", unsafe_allow_html=True)
