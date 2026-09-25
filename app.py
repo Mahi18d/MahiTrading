@@ -505,7 +505,7 @@ with main_tab_equity:
     with eq_f3:
         search_query = st.text_input("Search Equity Ticker", placeholder="Search ticker (e.g. RELIANCE, TCS)...")
 
-    mode_label = '<span class="mode-badge-paper">📝 ACTIVE ENVIRONMENT: PAPER TRADING (SIMULATION)</span>' if is_paper_trading else '<span class="mode-badge-live">⚡ ACTIVE ENVIRONMENT: LIVE ANGEL ONE BROKER</span>'
+    mode_label = '<span class="mode-badge-paper">📝 ACTIVE: PAPER TRADING (SIMULATION)</span>' if is_paper_trading else '<span class="mode-badge-live">⚡ ACTIVE: LIVE BROKER</span>'
     st.markdown(f"""
     <div class="disclaimer-banner" style="display:flex; justify-content:space-between; align-items:center;">
         <span>Algorithmic 10-Point Technical Engine: MTF Daily 50 EMA, Session VWAP, ORB Breakout & Dynamic 1:3 ROBO Risk Exits.</span>
@@ -538,35 +538,29 @@ with main_tab_equity:
             volume = df['Volume']
             open_s = df['Open']
 
-            # Intraday Moving Averages
             ema20 = close.ewm(span=20, adjust=False).mean()
             ema50 = close.ewm(span=50, adjust=False).mean()
 
-            # RSI Calculation
             delta = close.diff()
             gain = (delta.where(delta > 0, 0)).rolling(14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
             rs = gain / loss.replace(0, np.nan)
             rsi = 100 - (100 / (1 + rs))
 
-            # ATR for Order Sizing
             tr1 = high - low
             tr2 = (high - close.shift(1)).abs()
             tr3 = (low - close.shift(1)).abs()
             tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
             atr_val = float(tr.rolling(14).mean().iloc[-1])
 
-            # Intraday VWAP Calculation (Cumulative)
             typical_price = (high + low + close) / 3.0
             cum_vol = volume.cumsum()
             vwap_series = (typical_price * volume).cumsum() / cum_vol.replace(0, np.nan)
             c_vwap = float(vwap_series.iloc[-1]) if pd.notna(vwap_series.iloc[-1]) else float(close.iloc[-1])
 
-            # Opening Range (First Candle High / Low)
             orb_high = float(high.iloc[0])
             orb_low = float(low.iloc[0])
 
-            # Support & Resistance Extrema
             res = float(high.iloc[-extrema_order:].max())
             sup = float(low.iloc[-extrema_order:].min())
 
@@ -667,7 +661,6 @@ with main_tab_equity:
         except Exception:
             continue
 
-    # Auto-evaluate open paper positions against current prices
     evaluate_paper_positions(current_live_prices)
 
     df_results = pd.DataFrame(rows)
@@ -715,12 +708,9 @@ with main_tab_equity:
             stock = checklists[active_sym]
             chg_c = "#34d399" if stock['chg'] >= 0 else "#fb7185"
 
-            # -------------------------------------------------------------
-            # 1:3 RISK-TO-REWARD RATIO CALCULATIONS
-            # -------------------------------------------------------------
             atr_val = stock['atr']
             stop_points = round(float(1.5 * atr_val), 1)
-            target_points = round(float(4.5 * atr_val), 1)  # 3x Stop Loss = 1:3 RRR
+            target_points = round(float(4.5 * atr_val), 1)  # 1:3 RRR
 
             is_bull = stock['buy_score'] >= stock['sell_score']
             sl_price = stock['ltp'] - stop_points if is_bull else stock['ltp'] + stop_points
@@ -760,7 +750,6 @@ with main_tab_equity:
             </div>
             """, unsafe_allow_html=True)
 
-            # Amount & P&L Sizing Engine
             st.markdown("""
             <div style="margin-top:12px; padding:10px 14px; background:linear-gradient(90deg, rgba(15,23,42,0.8), rgba(30,27,75,0.8)); border:1px solid rgba(255,255,255,0.08); border-radius:6px;">
                 <span style="font-size:13px; font-weight:700; color:#fff;">💰 Amount & P&L Sizing Engine</span>
@@ -898,35 +887,118 @@ with main_tab_equity:
                             st.warning("⚠️ Connect Angel One below first.")
 
 # =========================================================================
-# TAB 2: F&O INTELLIGENCE (DERIVATIVES ENGINE)
+# TAB 2: F&O INTELLIGENCE (10-POINT STRATEGY & AUTOMATED STRIKE SELECTION)
 # =========================================================================
 with main_tab_fo:
     st.markdown("""
     <div class="disclaimer-banner">
-        Futures Open Interest (OI) Buildup, PCR Sentiment & Options Capital / P&L Calculators.
+        Derivatives Screener: 10-Point Technical Engine, PCR, Open Interest Buildup & Systematic Strike Selection (ITM Delta ~ 0.65).
     </div>
     """, unsafe_allow_html=True)
 
     fo_tickers = [info[0] for info in FO_UNIVERSE.values()]
-    fo_raw = yf.download(fo_tickers, period="5d", interval="1d", group_by='ticker', progress=False, threads=True)
+    
+    @st.cache_data(ttl=180)
+    def fetch_fo_market_data():
+        # Fetch Intraday and Daily for 10-Point Evaluation on Derivatives Universe
+        fo_intra = yf.download(fo_tickers, period=period, interval=interval, group_by='ticker', progress=False, threads=True)
+        fo_daily = yf.download(fo_tickers, period="1y", interval="1d", group_by='ticker', progress=False, threads=True)
+        return fo_intra, fo_daily
+
+    fo_intra, fo_daily = fetch_fo_market_data()
 
     fo_rows = []
-    fo_details = {}
+    fo_checklists = {}
 
     for name, (ticker, lot_size) in FO_UNIVERSE.items():
         try:
-            f_df = fo_raw[ticker].dropna()
-            if len(f_df) < 2:
+            f_df = fo_intra[ticker].dropna()
+            if len(f_df) < 20:
                 continue
 
-            f_close = float(f_df['Close'].iloc[-1])
-            f_prev = float(f_df['Close'].iloc[-2])
-            f_chg = ((f_close - f_prev) / f_prev) * 100
-            
-            f_vol = float(f_df['Volume'].iloc[-1])
-            f_prev_vol = float(f_df['Volume'].iloc[-2])
-            vol_chg = ((f_vol - f_prev_vol) / f_prev_vol) * 100 if f_prev_vol > 0 else 0.0
+            f_close = f_df['Close']
+            f_high = f_df['High']
+            f_low = f_df['Low']
+            f_vol = f_df['Volume']
+            f_open = f_df['Open']
 
+            c_ltp = float(f_close.iloc[-1])
+            c_prev = float(f_close.iloc[-2])
+            c_open = float(f_open.iloc[0])
+            f_chg = ((c_ltp - c_prev) / c_prev) * 100
+
+            # Intraday Indicators
+            f_ema20 = float(f_close.ewm(span=20, adjust=False).mean().iloc[-1])
+            f_ema50 = float(f_close.ewm(span=50, adjust=False).mean().iloc[-1])
+
+            # RSI
+            f_delta = f_close.diff()
+            f_gain = (f_delta.where(f_delta > 0, 0)).rolling(14).mean()
+            f_loss = (-f_delta.where(f_delta < 0, 0)).rolling(14).mean()
+            f_rs = f_gain / f_loss.replace(0, np.nan)
+            f_rsi = float((100 - (100 / (1 + f_rs))).iloc[-1]) if pd.notna(f_rs.iloc[-1]) else 50.0
+
+            # Intraday VWAP
+            f_typical = (f_high + f_low + f_close) / 3.0
+            f_cum_vol = f_vol.cumsum()
+            f_vwap_series = (f_typical * f_vol).cumsum() / f_cum_vol.replace(0, np.nan)
+            c_vwap = float(f_vwap_series.iloc[-1]) if pd.notna(f_vwap_series.iloc[-1]) else c_ltp
+
+            # ORB Range
+            orb_high = float(f_high.iloc[0])
+            orb_low = float(f_low.iloc[0])
+
+            # Dynamic Support & Resistance
+            f_res = float(f_high.iloc[-extrema_order:].max())
+            f_sup = float(f_low.iloc[-extrema_order:].min())
+
+            cur_vol = float(f_vol.iloc[-1])
+            avg_vol_20 = float(f_vol.iloc[-20:].mean()) if len(f_vol) >= 20 else cur_vol
+
+            # MTF Daily 50 EMA Macro Alignment
+            d_ok = False
+            f_daily_ema50 = c_ltp
+            try:
+                f_d_df = fo_daily[ticker].dropna()
+                if len(f_d_df) >= 50:
+                    d_ema = f_d_df['Close'].ewm(span=50, adjust=False).mean()
+                    f_daily_ema50 = float(d_ema.iloc[-1])
+                    d_ok = c_ltp > f_daily_ema50
+                else:
+                    d_ok = c_ltp > f_ema50
+            except Exception:
+                d_ok = c_ltp > f_ema50
+
+            # 10-Point Strategy Evaluation
+            c1_pass = d_ok
+            c2_pass = c_ltp > c_vwap
+            c3_pass = c_ltp > orb_high
+            c4_pass = c_ltp > f_ema20
+            c5_pass = c_ltp > f_ema50
+            c6_pass = 50.0 <= f_rsi <= 70.0
+            c7_pass = cur_vol > (1.25 * avg_vol_20)
+            c8_pass = c_ltp > c_open
+            c9_pass = (((c_ltp - f_sup) / c_ltp) <= 0.02) or (c_ltp >= orb_high)
+            c10_pass = ((f_res - c_ltp) / c_ltp) >= 0.02
+
+            checks = [
+                ("1. MTF Macro Filter", c1_pass, f"Daily 50 EMA: ₹{f_daily_ema50:.2f}"),
+                ("2. VWAP Baseline", c2_pass, f"VWAP: ₹{c_vwap:.2f}"),
+                ("3. ORB Breakout", c3_pass, f"ORB High: ₹{orb_high:.2f}"),
+                ("4. Short-Term Trend", c4_pass, f"20 EMA: ₹{f_ema20:.2f}"),
+                ("5. Intermediate Trend", c5_pass, f"50 EMA: ₹{f_ema50:.2f}"),
+                ("6. RSI Momentum Corridor", c6_pass, f"RSI @ {f_rsi:.1f} (50-70)"),
+                ("7. Volume Expansion", c7_pass, f"{cur_vol:,.0f} vs {1.25*avg_vol_20:,.0f}"),
+                ("8. Positive Session Momentum", c8_pass, f"Open: ₹{c_open:.2f} ({f_chg:+.2f}%)"),
+                ("9. Support/Breakout Validation", c9_pass, "Near Support or Confirmed ORB"),
+                ("10. Room to Target", c10_pass, f"Res: ₹{f_res:.2f} (≥2% clearance)")
+            ]
+
+            buy_score = sum(1 for _, met, _ in checks if met)
+            sell_score = 10 - buy_score
+
+            # Open Interest Buildup & Sentiment
+            vol_chg = ((cur_vol - avg_vol_20) / avg_vol_20) * 100 if avg_vol_20 > 0 else 0.0
             if f_chg > 0 and vol_chg > 0:
                 buildup = "LONG BUILDUP"
                 buildup_color = "#34d399"
@@ -941,31 +1013,54 @@ with main_tab_fo:
                 buildup_color = "#fbbf24"
 
             pcr = round(np.clip(1.0 + (f_chg * 0.08), 0.55, 1.85), 2)
-            pcr_sentiment = "BULLISH (> 1.0)" if pcr >= 1.0 else "BEARISH (< 1.0)"
-
             step = 50 if "NIFTY" in name else (100 if "BANK" in name else 20)
-            atm_strike = int(round(f_close / step) * step)
+            atm_strike = int(round(c_ltp / step) * step)
 
-            fo_details[name] = {
-                "ltp": f_close,
+            # Quantitative Contract & Strike Selection Rule
+            if buy_score >= 7:
+                recommended_opt = "CALL (CE)"
+                recommended_strike = atm_strike - step  # 1-Strike ITM Call for high Delta
+                rec_rationale = "High Conviction Long (Score ≥ 7) ➔ 1 Strike ITM Call (Delta ~0.65, Low Theta Decay)"
+                bias_tag = "STRONG_BULLISH"
+            elif sell_score >= 7:
+                recommended_opt = "PUT (PE)"
+                recommended_strike = atm_strike + step  # 1-Strike ITM Put
+                rec_rationale = "High Conviction Short (Score ≥ 7) ➔ 1 Strike ITM Put (Delta ~0.65, Low Theta Decay)"
+                bias_tag = "STRONG_BEARISH"
+            else:
+                recommended_opt = "CALL (CE)" if buy_score >= sell_score else "PUT (PE)"
+                recommended_strike = atm_strike
+                rec_rationale = "Consolidation / Rangebound (Score ≤ 6) ➔ Non-Directional / Credit Spread Preferred"
+                bias_tag = "CONSOLIDATION"
+
+            fo_checklists[name] = {
+                "ltp": c_ltp,
                 "chg": f_chg,
                 "lot": lot_size,
+                "step": step,
+                "atm_strike": atm_strike,
+                "recommended_opt": recommended_opt,
+                "recommended_strike": recommended_strike,
+                "rec_rationale": rec_rationale,
+                "bias_tag": bias_tag,
                 "buildup": buildup,
                 "buildup_color": buildup_color,
                 "pcr": pcr,
-                "pcr_sentiment": pcr_sentiment,
-                "atm_strike": atm_strike,
-                "step": step
+                "vwap": c_vwap,
+                "orb_high": orb_high,
+                "checks": checks,
+                "buy_score": buy_score,
+                "sell_score": sell_score
             }
 
             fo_rows.append({
                 "Contract": name,
-                "Underlying LTP": round(f_close, 2),
+                "Underlying LTP": round(c_ltp, 2),
                 "Chg%": round(f_chg, 2),
+                "Score": f"{buy_score}/10 Buy" if buy_score >= sell_score else f"{sell_score}/10 Sell",
+                "Recommended Trade": f"{recommended_strike} {recommended_opt.split()[0]}",
                 "Buildup": buildup,
                 "PCR": pcr,
-                "Sentiment": pcr_sentiment,
-                "ATM Strike": atm_strike,
                 "Lot Size": lot_size
             })
         except Exception:
@@ -973,7 +1068,7 @@ with main_tab_fo:
 
     df_fo = pd.DataFrame(fo_rows)
 
-    fo_left, fo_right = st.columns([6.6, 3.4])
+    fo_left, fo_right = st.columns([6.4, 3.6])
 
     with fo_left:
         fo_grid = st.dataframe(
@@ -987,7 +1082,7 @@ with main_tab_fo:
                 "Chg%": st.column_config.NumberColumn(format="%+.2f%%"),
                 "PCR": st.column_config.NumberColumn(format="%.2f"),
             },
-            height=580
+            height=620
         )
 
     with fo_right:
@@ -1000,15 +1095,20 @@ with main_tab_fo:
         if not active_fo:
             active_fo = df_fo.iloc[0]["Contract"] if not df_fo.empty else "NIFTY"
 
-        if active_fo in fo_details:
-            fo_item = fo_details[active_fo]
+        if active_fo in fo_checklists:
+            fo_item = fo_checklists[active_fo]
             fo_chg_c = "#34d399" if fo_item['chg'] >= 0 else "#fb7185"
+
+            fo_items_html = "".join([
+                f'<div class="check-item"><span>{"✅" if passed else "❌"} {rule}</span><span class="{"tag-bull" if passed else "tag-bear"}">{detail}</span></div>'
+                for rule, passed, detail in fo_item['checks']
+            ])
 
             st.markdown(f"""
             <div class="inspector-card">
                 <div style="display:flex; justify-content:space-between; align-items:flex-start;">
                     <div>
-                        <div style="font-size:22px; font-weight:800; color:#fff; font-family:'JetBrains Mono', monospace;">{active_fo} DERIVATIVES</div>
+                        <div style="font-size:22px; font-weight:800; color:#fff; font-family:'JetBrains Mono', monospace;">{active_fo} F&O</div>
                         <div style="font-size:24px; font-weight:800; color:#fff; margin: 4px 0;">
                             ₹{fo_item['ltp']:.2f} <span style="font-size:13px; color:{fo_chg_c}">({fo_item['chg']:+.2f}%)</span>
                         </div>
@@ -1017,39 +1117,46 @@ with main_tab_fo:
                         {fo_item['buildup']}
                     </span>
                 </div>
-                <div style="display:flex; justify-content:space-between; font-size:12px; margin: 10px 0; padding: 8px 12px; background:rgba(30, 41, 59, 0.6); border-radius:6px;">
-                    <div>PCR: <strong style="color:#00f2fe;">{fo_item['pcr']}</strong></div>
-                    <div>SENTIMENT: <strong>{fo_item['pcr_sentiment']}</strong></div>
-                    <div>LOT SIZE: <strong>{fo_item['lot']}</strong></div>
+                <div style="margin: 8px 0; padding: 8px 12px; background:rgba(30, 41, 59, 0.7); border-left: 3px solid #00f2fe; border-radius:4px; font-size:11px; color:#cbd5e1;">
+                    🎯 <strong>System Recommendation:</strong><br>{fo_item['rec_rationale']}
                 </div>
-                <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom: 12px; padding: 8px 12px; background:rgba(15, 23, 42, 0.7); border:1px solid rgba(255,255,255,0.06); border-radius:6px;">
-                    <div>ATM STRIKE: <strong style="color:#fbbf24;">{fo_item['atm_strike']}</strong></div>
-                    <div>CE OTM: <strong>{fo_item['atm_strike'] + fo_item['step']}</strong></div>
-                    <div>PE OTM: <strong>{fo_item['atm_strike'] - fo_item['step']}</strong></div>
+                <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom: 8px; padding: 6px 12px; background:rgba(15, 23, 42, 0.6); border-radius:6px;">
+                    <div>VWAP: <strong style="color:#00f2fe;">₹{fo_item['vwap']:.2f}</strong></div>
+                    <div>ORB HIGH: <strong style="color:#fbbf24;">₹{fo_item['orb_high']:.2f}</strong></div>
+                    <div>PCR: <strong>{fo_item['pcr']}</strong></div>
                 </div>
+                <div style="font-size:11px; font-weight:700; color:#94a3b8; text-transform:uppercase; margin-bottom:6px; letter-spacing:0.5px;">
+                    SCORE: <span style="color:#34d399;">{fo_item['buy_score']}/10 BUY</span> &nbsp;·&nbsp; <span style="color:#fb7185;">{fo_item['sell_score']}/10 SELL</span>
+                </div>
+                {fo_items_html}
             </div>
             """, unsafe_allow_html=True)
 
+            # Automated Strike Selection & Options Sizing Engine
             st.markdown(f"""
             <div class="bottom-card" style="margin-top:12px; padding:12px;">
-                <div style="font-size:13px; font-weight:700; color:#fff; margin-bottom:8px;">🎯 Options Position & Payoff Calculator</div>
+                <div style="font-size:13px; font-weight:700; color:#fff; margin-bottom:8px;">🎯 Systematic Strike Execution (1:3 Payoff)</div>
             </div>
             """, unsafe_allow_html=True)
 
             opt_c1, opt_c2 = st.columns(2)
             with opt_c1:
-                opt_type = st.selectbox("Option Type", ["CALL (CE)", "PUT (PE)"], key=f"opt_type_{active_fo}")
+                # Pre-fill recommended option type based on score
+                def_opt_idx = 0 if fo_item['recommended_opt'] == "CALL (CE)" else 1
+                opt_type = st.selectbox("Option Type", ["CALL (CE)", "PUT (PE)"], index=def_opt_idx, key=f"opt_type_{active_fo}")
             with opt_c2:
-                selected_strike = st.number_input("Strike Price", value=fo_item['atm_strike'], step=fo_item['step'], key=f"strike_{active_fo}")
+                # Pre-fill recommended ITM strike
+                selected_strike = st.number_input("Strike Price", value=fo_item['recommended_strike'], step=fo_item['step'], key=f"strike_{active_fo}")
 
             opt_q1, opt_q2 = st.columns(2)
             with opt_q1:
                 lots = st.number_input("Number of Lots", min_value=1, value=1, step=1, key=f"lots_{active_fo}")
             with opt_q2:
-                est_premium = st.number_input("Option Premium (₹)", min_value=1.0, value=120.0, step=5.0, key=f"prem_{active_fo}")
+                est_premium = st.number_input("Estimated Premium (₹)", min_value=1.0, value=150.0, step=5.0, key=f"prem_{active_fo}")
 
-            opt_sl_pts = st.slider("Stop-Loss (Points)", min_value=5, max_value=100, value=25, step=5, key=f"osl_{active_fo}")
-            opt_tp_pts = st.slider("Profit Target (Points)", min_value=10, max_value=250, value=75, step=5, key=f"otp_{active_fo}")
+            # 1:3 Systematic Risk-to-Reward Ratio on Premium
+            opt_sl_pts = st.slider("Stop-Loss Points (₹)", min_value=5, max_value=100, value=25, step=5, key=f"osl_{active_fo}")
+            opt_tp_pts = opt_sl_pts * 3  # Exact 1:3 Reward
 
             total_contracts = lots * fo_item['lot']
             total_premium_amount = total_contracts * est_premium
@@ -1063,16 +1170,20 @@ with main_tab_fo:
                     <strong style="color:#ffffff;">{total_contracts} Qty</strong>
                 </div>
                 <div class="calc-row">
-                    <span style="color:#94a3b8;">Premium Capital Needed to Buy:</span>
+                    <span style="color:#94a3b8;">Premium Required:</span>
                     <strong style="color:#00f2fe; font-size:14px;">₹{total_premium_amount:,.2f}</strong>
                 </div>
                 <div class="calc-row">
-                    <span style="color:#94a3b8;">Estimated Profit on Target (+{opt_tp_pts} pts):</span>
+                    <span style="color:#94a3b8;">Expected Profit (Target +{opt_tp_pts} pts):</span>
                     <strong style="color:#34d399; font-size:14px;">+₹{opt_profit:,.2f}</strong>
                 </div>
                 <div class="calc-row">
-                    <span style="color:#94a3b8;">Estimated Loss on SL (-{opt_sl_pts} pts):</span>
+                    <span style="color:#94a3b8;">Expected Loss (Stop-Loss -{opt_sl_pts} pts):</span>
                     <strong style="color:#fb7185; font-size:14px;">-₹{opt_loss:,.2f}</strong>
+                </div>
+                <div class="calc-row" style="border-top:1px solid rgba(255,255,255,0.06); margin-top:4px; padding-top:4px;">
+                    <span style="color:#94a3b8;">Net Premium Payoff:</span>
+                    <strong style="color:#00f2fe;">1 : 3.00 RRR</strong>
                 </div>
             </div>
             """, unsafe_allow_html=True)
@@ -1101,7 +1212,6 @@ with main_tab_fo:
 with tab_paper_ledger:
     pdata = st.session_state["paper_data"]
     
-    # Portfolio Balance Metrics
     total_invested = sum(p["qty"] * p["entry_price"] for p in pdata["positions"])
     cur_equity = pdata["cash"] + total_invested
     total_realized_pnl = sum(t["pnl"] for t in pdata["closed_trades"])
