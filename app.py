@@ -4,6 +4,7 @@ import concurrent.futures
 from datetime import datetime, timedelta
 import gzip
 import hashlib
+import hmac
 from io import StringIO
 import json
 import logging
@@ -11,6 +12,7 @@ import os
 import re
 import sys
 import threading
+import uuid
 import time
 import importlib.util
 import urllib.request
@@ -1073,6 +1075,40 @@ def build_fo_composite_gate(underlying_snapshot, underlying_evidence, selected_c
     return result
 
 
+def calculate_investment_plan(entry, stop, target, quantity):
+    """A delivery-buy plan; an entered price is never an attached broker exit."""
+    values = [_as_float(value) for value in (entry, stop, target, quantity)]
+    if any(value is None or not np.isfinite(value) or value <= 0 for value in values):
+        raise ValueError("Entry, stop, target and quantity must be positive finite numbers.")
+    entry, stop, target, quantity = values
+    if quantity != int(quantity):
+        raise ValueError("Quantity must be a whole number.")
+    if not stop < entry < target:
+        raise ValueError("For a delivery BUY, stop must be below entry and target above entry.")
+    result = calculate_directional_preview("BUY", entry, entry - stop, target - entry, int(quantity))
+    result.update(stop_percent=(entry - stop) / entry * 100,
+                  target_percent=(target - entry) / entry * 100)
+    return result
+
+
+def risk_budget_warnings(planned_loss, trades, limits, today):
+    """Advisory paper risk budgets using recorded, gross results only."""
+    todays = [t for t in trades if str(t.get("timestamp", ""))[:10] == str(today)]
+    closed_today = [t for t in trades if str(t.get("exit_time", ""))[:10] == str(today)]
+    net_realized = sum(_as_float(t.get("pnl")) or 0.0 for t in closed_today)
+    warnings = []
+    per_trade = _as_float(limits.get("per_trade")) or 0
+    daily_loss = _as_float(limits.get("daily_loss")) or 0
+    max_trades = _as_int(limits.get("max_trades")) or 0
+    if per_trade > 0 and planned_loss is not None and planned_loss > per_trade:
+        warnings.append(f"Planned loss ₹{planned_loss:,.2f} exceeds your ₹{per_trade:,.2f} per-trade budget.")
+    if daily_loss > 0 and max(0.0, -net_realized) >= daily_loss:
+        warnings.append("Your recorded paper daily loss budget has been reached.")
+    if max_trades > 0 and len(todays) >= max_trades:
+        warnings.append("Your paper trade-count budget has been reached.")
+    return {"warnings": warnings, "trade_count": len(todays), "realized_pnl": net_realized}
+
+
 def calculate_directional_preview(action, entry_price, stop_points, target_points, quantity):
     """Calculate direction-aware levels and illustrative P&L without trading."""
     side = str(action).upper()
@@ -1201,7 +1237,15 @@ def _market_frame_for_symbol(batch_data, symbol):
     if not isinstance(batch_data, pd.DataFrame) or batch_data.empty:
         return pd.DataFrame()
     try:
-        frame = batch_data[symbol] if isinstance(batch_data.columns, pd.MultiIndex) else batch_data
+        if isinstance(batch_data.columns, pd.MultiIndex):
+            if symbol in batch_data.columns.get_level_values(0):
+                frame = batch_data[symbol]
+            elif symbol in batch_data.columns.get_level_values(1):
+                frame = batch_data.xs(symbol, axis=1, level=1)
+            else:
+                return pd.DataFrame()
+        else:
+            frame = batch_data
     except (KeyError, TypeError, AttributeError):
         return pd.DataFrame()
     required = ["Open", "High", "Low", "Close", "Volume"]
@@ -1240,7 +1284,7 @@ def market_scan_action(trend, horizon):
     return "NEUTRAL / NO TRADE"
 
 
-def evaluate_equity_intelligence_scan(symbols, intraday_data, daily_data, extrema_order):
+def evaluate_equity_intelligence_scan(symbols, intraday_data, daily_data, extrema_order, interval=None, signal_now=None):
     """Evaluate one batch with the same ten independent equity checks used by the UI.
 
     The result keeps every requested constituent.  A missing public response is
@@ -1284,8 +1328,9 @@ def evaluate_equity_intelligence_scan(symbols, intraday_data, daily_data, extrem
             atr_value = atr_candidate if atr_candidate is not None and atr_candidate > 0 else max(ltp * 0.015, 0.01)
 
             typical_price = (high + low + close) / 3.0
-            cumulative_volume = volume.fillna(0).cumsum()
-            vwap_series = (typical_price * volume.fillna(0)).cumsum() / cumulative_volume.replace(0, np.nan)
+            session_groups = pd.DatetimeIndex(frame.index).date
+            cumulative_volume = volume.fillna(0).groupby(session_groups).cumsum()
+            vwap_series = (typical_price * volume.fillna(0)).groupby(session_groups).cumsum() / cumulative_volume.replace(0, np.nan)
             vwap_value = _as_float(vwap_series.iloc[-1])
             volume_available = bool(volume.fillna(0).gt(0).any())
 
@@ -1374,6 +1419,8 @@ def evaluate_equity_intelligence_scan(symbols, intraday_data, daily_data, extrem
                 "sell_score": sell_score,
                 "evidence_summary": evidence_summary,
                 "setup": setup,
+                "candle_time": pd.Timestamp(frame.index[-1]).isoformat(),
+                "signal": detect_price_action_setup(frame, interval, signal_now),
             }
             rows.append({
                 "Symbol": clean_symbol,
@@ -1808,6 +1855,158 @@ def fetch_official_news_feeds(source_configs, urlopen_fn=None, limit_per_source=
     }
 
 
+def brief_published_time(value, source=None):
+    """An undated headline never becomes today's news."""
+    from email.utils import parsedate_to_datetime
+
+    if not value:
+        return None
+    try:
+        parsed = parsedate_to_datetime(str(value))
+    except (TypeError, ValueError, OverflowError):
+        try:
+            parsed = pd.Timestamp(value).to_pydatetime()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if parsed.tzinfo is None:
+        # These Indian official feeds sometimes omit an offset. Keep the
+        # explicit assumption visible next to the hint; other feeds fail closed.
+        if source not in {"RBI", "SEBI", "PIB"}:
+            return None
+        parsed = parsed.replace(tzinfo=IST_TIMEZONE)
+    return parsed.astimezone(IST_TIMEZONE)
+
+
+def classify_market_headline(title):
+    """Conservative headline cues, not article summaries or trading predictions."""
+    clean = re.sub(r"\s+", " ", html.unescape(str(title))).strip()
+    lower = clean.lower()
+    relevant = bool(re.search(
+        r"\b(rbi|repo|inflation|gdp|monetary|liquidity|interest rate|crude|oil|"
+        r"rupee|budget|tariff|exports?|imports?|sebi|board meeting|stock|equity|"
+        r"securities|market|banking|fiscal|industrial production|earnings)\b", lower,
+    ))
+    routine = bool(re.search(
+        r"recovery certificate|release order|adjudication|settlement order|"
+        r"order in the matter|penalty|defaulter|public shareholding", lower,
+    ))
+    ambiguous = bool(re.search(
+        r"\b(no|not|denies|denied|unlikely|may|might|could|expected|forecast|"
+        r"proposal|proposed|whether)\b|\?", lower,
+    ))
+    positive = bool(re.search(
+        r"\binflation\b.{0,35}\b(eases|eased|falls|fell|declines|declined|slows)\b|"
+        r"\b(repo|policy|interest) rate\b.{0,25}\b(cut|cuts|reduced|reduction)\b|"
+        r"\b(gdp|exports|industrial production)\b.{0,35}\b(accelerates|accelerated|expands|expanded|rises|rose)\b", lower,
+    ))
+    negative = bool(re.search(
+        r"\binflation\b.{0,35}\b(rises|rose|accelerates|accelerated|surges|surged)\b|"
+        r"\b(repo|policy|interest) rate\b.{0,25}\b(hike|hikes|raised|increase)\b|"
+        r"\b(gdp|exports|industrial production)\b.{0,35}\b(contracts|contracted|falls|fell|shrinks|slows)\b", lower,
+    ))
+    category = "watch"
+    if relevant and not routine and not ambiguous and positive != negative:
+        category = "good" if positive else "bad"
+    return {"title": clean, "category": category, "relevant": relevant and not routine}
+
+
+def build_brief_market_rows(raw, market_symbols):
+    """Keep each daily observation tied to its own symbol and source date."""
+    rows = []
+    if not isinstance(raw, pd.DataFrame) or raw.empty:
+        return rows
+    for name, symbol in market_symbols.items():
+        try:
+            if isinstance(raw.columns, pd.MultiIndex):
+                frame = raw[symbol] if symbol in raw.columns.get_level_values(0) else raw.xs(symbol, axis=1, level=1)
+            elif len(market_symbols) == 1:
+                frame = raw
+            else:
+                continue
+            close = pd.to_numeric(frame["Close"], errors="coerce").dropna().sort_index()
+            close = close[~close.index.duplicated(keep="last")]
+            if len(close) < 2:
+                continue
+            latest, previous = float(close.iloc[-1]), float(close.iloc[-2])
+            if not np.isfinite([latest, previous]).all() or min(latest, previous) <= 0:
+                continue
+            source_date = pd.Timestamp(close.index[-1]).date()
+            rows.append({
+                "Market": name, "Last price": latest, "Change %": (latest / previous - 1.0) * 100,
+                "Source session": source_date.isoformat(), "source_date": source_date,
+                "link": f"https://finance.yahoo.com/quote/{quote(symbol, safe='')}/",
+            })
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+    return rows
+
+
+def build_market_quick_brief(news_items, market_rows, now=None):
+    """Short, traceable hints; missing or old sources remain explicit."""
+    current = now or ist_now()
+    current = current.replace(tzinfo=IST_TIMEZONE) if current.tzinfo is None else current.astimezone(IST_TIMEZONE)
+    groups = {"good": [], "bad": [], "watch": []}
+    seen, dated_news = set(), []
+    old_news = 0
+    for item in news_items or []:
+        cue = classify_market_headline(item.get("title", ""))
+        identity = cue["title"].casefold()
+        if not identity or identity in seen:
+            continue
+        seen.add(identity)
+        published = brief_published_time(item.get("published"), item.get("source"))
+        if not published or not timedelta(0) <= current - published <= timedelta(hours=72):
+            old_news += 1
+            continue
+        if cue["relevant"]:
+            dated_news.append((published, item, cue))
+    for published, item, cue in sorted(dated_news, key=lambda row: row[0], reverse=True):
+        words = cue["title"].split()
+        short_title = " ".join(words[:19]) + ("…" if len(words) > 19 else "")
+        groups[cue["category"]].append({
+            "text": short_title,
+            "detail": f"{item.get('source', 'Source')} · {published.strftime('%d %b %H:%M IST')}" + (" (IST assumed; feed omitted timezone)" if brief_published_time(item.get("published")) is None else ""),
+            "link": item.get("link") or item.get("source_url") or "",
+        })
+    recent_markets = []
+    for row in market_rows or []:
+        age_days = (current.date() - row["source_date"]).days
+        if not 0 <= age_days <= 4:
+            continue
+        recent_markets.append(row)
+        change = row["Change %"]
+        if abs(change) < 0.1:
+            continue
+        category = "good" if change > 0 else "bad"
+        groups[category].append({
+            "text": f"{row['Market']} {'up' if change > 0 else 'down'} {abs(change):.2f}% in its latest daily snapshot.",
+            "detail": f"Public chart · session {row['Source session']}", "link": row["link"],
+        })
+    indian_names = {"NIFTY 50", "BANKNIFTY", "SENSEX"}
+    indian = [row for row in recent_markets if row["Market"] in indian_names]
+    if len(indian) < 2 or len({row["source_date"] for row in indian}) != 1:
+        mood, reason = "Not enough data", "Need matching recent Indian index sessions to describe the market."
+    else:
+        up = sum(row["Change %"] >= 0.1 for row in indian)
+        down = sum(row["Change %"] <= -0.1 for row in indian)
+        mood = "Positive" if up == len(indian) else "Cautious" if down == len(indian) else "Mixed"
+        reason = f"{up} Indian indices up · {down} down · {len(indian) - up - down} flat, session {indian[0]['Source session']}."
+    return {"groups": {key: value[:3] for key, value in groups.items()}, "mood": mood, "reason": reason, "older_news": old_news}
+
+
+def render_brief_hint(hint):
+    """Escape publisher text; only ordinary web links are rendered."""
+    link = str(hint.get("link", ""))
+    safe_link = link if re.match(r"^https?://", link, re.I) else ""
+    label = html.escape(str(hint["text"]))
+    linked = f'<a href="{html.escape(safe_link, quote=True)}" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:none;">{label} ↗</a>' if safe_link else label
+    st.markdown(
+        f"<div style='padding:10px 0;border-bottom:1px solid #ffffff16;font-size:14px;line-height:1.45'>{linked}"
+        f"<div style='color:#94a3b8;font-size:11px;margin-top:5px'>{html.escape(str(hint.get('detail', '')))}</div></div>",
+        unsafe_allow_html=True,
+    )
+
+
 def build_live_order_params(contract, quantity, action, order_kind, limit_price=None, stoploss_points=None, target_points=None):
     """Build a validated Angel One order payload from a broker-resolved contract."""
     side = str(action or "").upper()
@@ -1874,6 +2073,13 @@ def fetch_selected_option_snapshot(smart_api, contract):
     data = response.get("data") or {}
     if isinstance(data, list):
         data = data[0] if data else {}
+    if isinstance(data, dict):
+        returned_token = str(data.get("symboltoken") or data.get("symbolToken") or "")
+        returned_exchange = str(data.get("exchange") or "").upper()
+        if returned_token and returned_token != str(contract["token"]):
+            return {"ok": False, "state": "mismatch", "message": "Broker quote belongs to a different token; refresh the instrument master."}
+        if returned_exchange and returned_exchange != str(contract.get("exchange", "NFO")).upper():
+            return {"ok": False, "state": "mismatch", "message": "Broker quote belongs to a different exchange."}
     ltp = _as_float(data.get("ltp") or data.get("last_traded_price")) if isinstance(data, dict) else None
     if ltp is None or ltp <= 0:
         return {"ok": False, "state": "unavailable", "message": "Broker response contains no usable LTP."}
@@ -1969,6 +2175,128 @@ def fetch_option_candles(smart_api, contract, interval="FIVE_MINUTE"):
     if not rows:
         return {"ok": False, "state": "unavailable", "message": "Broker returned no candles for this contract.", "candles": []}
     return {"ok": True, "state": "snapshot", "candles": rows, "fetched_at": time.time(), "source": "Angel One SmartAPI candle data"}
+
+
+def completed_signal_candles(frame, interval, now=None):
+    """Use candle-start timestamps to exclude every still-forming bar."""
+    durations = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60,
+                 "ONE_MINUTE": 1, "FIVE_MINUTE": 5, "FIFTEEN_MINUTE": 15,
+                 "THIRTY_MINUTE": 30, "ONE_HOUR": 60, "1d": 1440, "1wk": 10080}
+    minutes = durations.get(interval)
+    if minutes is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return pd.DataFrame(), "Timeframe or candles unavailable."
+    try:
+        data = frame.copy()
+        stamps = pd.DatetimeIndex(pd.to_datetime(data["time"] if "time" in data.columns else data.index, errors="coerce"))
+        if stamps.isna().any():
+            return pd.DataFrame(), "Candle timestamps are invalid."
+        stamps = stamps.tz_localize(IST_TIMEZONE) if stamps.tz is None else stamps.tz_convert(IST_TIMEZONE)
+        data.index = stamps
+        if data.index.duplicated().any():
+            return pd.DataFrame(), "Duplicate candles need a source refresh."
+        data = data.sort_index()
+        stamp_now = pd.Timestamp(now or ist_now())
+        stamp_now = stamp_now.tz_localize(IST_TIMEZONE) if stamp_now.tzinfo is None else stamp_now.tz_convert(IST_TIMEZONE)
+        if interval == "1d":
+            ends = data.index.normalize() + pd.Timedelta(hours=15, minutes=30)
+        elif interval == "1wk":
+            ends = data.index.normalize() + pd.to_timedelta(4 - data.index.weekday, unit="D") + pd.Timedelta(hours=15, minutes=30)
+        else:
+            ends = data.index + pd.Timedelta(minutes=minutes)
+        data = data.loc[ends <= stamp_now].copy()
+        if data.empty:
+            return data, "Waiting for the first completed candle."
+        for col in ("Open", "High", "Low", "Close"):
+            data[col] = pd.to_numeric(data[col], errors="coerce")
+        valid = np.isfinite(data[["Open", "High", "Low", "Close"]]).all(axis=1)
+        valid &= data[["Open", "High", "Low", "Close"]].gt(0).all(axis=1)
+        valid &= (data["High"] >= data[["Open", "Close", "Low"]].max(axis=1)) & (data["Low"] <= data[["Open", "Close", "High"]].min(axis=1))
+        if not valid.all():
+            return pd.DataFrame(), "OHLC candles failed validation."
+        if minutes < 1440:
+            latest_end = data.index[-1] + pd.Timedelta(minutes=minutes)
+            if data.index[-1].date() != stamp_now.date() or (stamp_now - latest_end).total_seconds() > minutes * 120:
+                return data, "STALE: latest completed intraday candle is outside the current window."
+        else:
+            max_age = 5 if interval == "1d" else 12
+            if (stamp_now - data.index[-1]).total_seconds() > max_age * 86400:
+                return data, "STALE: historical source has not updated."
+        return data, ""
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return pd.DataFrame(), "Candles could not be validated."
+
+
+def detect_price_action_setup(frame, interval, now=None):
+    """Rules-based setup evidence; scores are not probabilities or predictions."""
+    data, issue = completed_signal_candles(frame, interval, now)
+    result = {"state": "DATA REQUIRED", "pattern": "No confirmed pattern", "reasons": [],
+              "candle_time": data.index[-1].isoformat() if not data.empty else "", "interval": interval}
+    if issue:
+        result.update(state="STALE / REVIEW ONLY" if issue.startswith("STALE") else "DATA REQUIRED", reasons=[issue])
+        return result
+    if len(data) < 30:
+        result["reasons"] = ["At least 30 completed candles are needed."]
+        return result
+    close = data["Close"]
+    ema9, ema20 = close.ewm(span=9, adjust=False).mean(), close.ewm(span=20, adjust=False).mean()
+    a, b = data.iloc[-1], data.iloc[-2]
+    prior = data.iloc[-21:-1]
+    ceiling, floor = float(prior.High.max()), float(prior.Low.min())
+    true_range = pd.concat([data.High-data.Low, (data.High-close.shift()).abs(), (data.Low-close.shift()).abs()], axis=1).max(axis=1)
+    atr = float(true_range.iloc[-15:-1].mean())
+    buffer = max(atr * .1, float(a.Close) * .0005)
+    bull_trend = a.Close > ema9.iloc[-1] > ema20.iloc[-1] and ema20.iloc[-1] > ema20.iloc[-4]
+    bear_trend = a.Close < ema9.iloc[-1] < ema20.iloc[-1] and ema20.iloc[-1] < ema20.iloc[-4]
+    bull, bear = [], []
+    if a.Close > ceiling + buffer:
+        bull.append("20-bar range breakout")
+    if a.Close < floor - buffer:
+        bear.append("20-bar range breakdown")
+    if b.Close < b.Open and a.Close > a.Open and a.Open <= b.Close and a.Close >= b.Open and a.Close > b.High:
+        bull.append("Bullish engulfing with high break")
+    if b.Close > b.Open and a.Close < a.Open and a.Open >= b.Close and a.Close <= b.Open and a.Close < b.Low:
+        bear.append("Bearish engulfing with low break")
+    body = abs(float(b.Close-b.Open))
+    span = float(b.High-b.Low)
+    if span > 0 and body >= .1*span:
+        lower, upper = min(b.Close,b.Open)-b.Low, b.High-max(b.Close,b.Open)
+        if lower >= 2*body and upper <= body and a.Close > b.High and b.Low <= float(data.Low.iloc[-8:-2].min()) + buffer:
+            bull.append("Hammer at support, next-candle confirmation")
+        if upper >= 2*body and lower <= body and a.Close < b.Low and b.High >= float(data.High.iloc[-8:-2].max()) - buffer:
+            bear.append("Shooting star at resistance, next-candle confirmation")
+    previous_ceiling, previous_floor = float(data.High.iloc[-22:-2].max()), float(data.Low.iloc[-22:-2].min())
+    if b.Close > previous_ceiling + buffer and abs(a.Low - previous_ceiling) <= buffer * 2 and a.Close > previous_ceiling + buffer:
+        bull.append("Breakout retest held")
+    if b.Close < previous_floor - buffer and abs(a.High - previous_floor) <= buffer * 2 and a.Close < previous_floor - buffer:
+        bear.append("Breakdown retest held")
+    volume = pd.to_numeric(data.get("Volume", pd.Series(index=data.index, dtype=float)), errors="coerce")
+    average_volume = volume.iloc[-21:-1].mean()
+    volume_ok = pd.notna(average_volume) and average_volume > 0 and pd.notna(volume.iloc[-1]) and volume.iloc[-1] >= 1.2 * average_volume
+    direction = "BULLISH" if bull and bull_trend and not bear else "BEARISH" if bear and bear_trend and not bull else None
+    reasons = []
+    if direction and volume_ok:
+        result.update(state=f"{direction} SETUP", pattern=" + ".join(bull if direction == "BULLISH" else bear))
+        reasons = ["Completed candle confirms the pattern.", "EMA 9/20 trend agrees.", f"Volume {volume.iloc[-1]:,.0f} ≥ 1.2× prior 20-bar average {average_volume:,.0f}."]
+    else:
+        result["state"] = "WAIT / NO CLEAN SETUP"
+        if bull or bear:
+            result["pattern"] = " + ".join(bull+bear)
+        reasons = ["Pattern and trend confirmation incomplete." if not direction else "Volume confirmation missing or below threshold."]
+        if float(a.High-a.Low) > 0 and abs(float(a.Close-a.Open)) <= .1 * float(a.High-a.Low):
+            result["pattern"] = "Doji / indecision"
+            reasons = ["Small candle body shows indecision; wait for a subsequent confirmed break."]
+    result["reasons"] = reasons
+    return result
+
+
+def render_setup_signal(signal, title="Price-action setup"):
+    signal = signal or {}
+    state = signal.get("state", "DATA REQUIRED")
+    colour = "#34d399" if state == "BULLISH SETUP" else "#fb7185" if state == "BEARISH SETUP" else "#fbbf24"
+    st.markdown(f"<div class='bottom-card'><div class='bottom-title'>{html.escape(title)}</div><strong style='color:{colour}'>{html.escape(state)}</strong><div>{html.escape(signal.get('pattern', 'No confirmed pattern'))}</div></div>", unsafe_allow_html=True)
+    st.caption(" · ".join(signal.get("reasons", [])))
+    if signal.get("candle_time"):
+        st.caption(f"Completed source candle: {signal['candle_time']} · {signal.get('interval')}. Rules-based evidence; no measured win rate claimed.")
 
 
 def run_self_tests():
@@ -2729,12 +3057,8 @@ def clear_all_short_lived_broker_cache():
             st.session_state.pop(key, None)
 
 def load_paper_account():
-    if os.path.exists(PAPER_FILE):
-        try:
-            with open(PAPER_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
+    # A public Streamlit server has one filesystem for all visitors. A global
+    # JSON account leaks portfolios across browser sessions; keep it private.
     return {
         "cash": 500000.0,
         "positions": [],
@@ -2742,27 +3066,27 @@ def load_paper_account():
     }
 
 def save_paper_account(data):
-    try:
-        with open(PAPER_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        pass
+    st.session_state["paper_data"] = data
 
 if "paper_data" not in st.session_state:
     st.session_state["paper_data"] = load_paper_account()
 
-def place_paper_order(symbol, action, qty, entry_price, sl_pts, tp_pts, trail_pts=0.0):
+def place_paper_order(symbol, action, qty, entry_price, sl_pts, tp_pts, trail_pts=0.0, metadata=None):
     pdata = st.session_state["paper_data"]
+    try:
+        calculate_directional_preview(action, entry_price, sl_pts, tp_pts, qty)
+    except (ValueError, TypeError) as exc:
+        return False, f"Invalid paper plan: {exc}"
     sl_price = round(entry_price - sl_pts if action == "BUY" else entry_price + sl_pts, 2)
     tp_price = round(entry_price + tp_pts if action == "BUY" else entry_price - tp_pts, 2)
     required_capital = qty * entry_price
 
-    if pdata["cash"] < required_capital and action == "BUY":
+    if pdata["cash"] < required_capital:
         return False, "Insufficient virtual balance."
 
     pdata["cash"] -= required_capital
     position = {
-        "id": f"PAPER-{int(datetime.now().timestamp())}",
+        "id": f"PAPER-{uuid.uuid4().hex[:12]}",
         "symbol": symbol,
         "action": action,
         "qty": qty,
@@ -2772,9 +3096,11 @@ def place_paper_order(symbol, action, qty, entry_price, sl_pts, tp_pts, trail_pt
         "sl_pts": sl_pts,
         "tp_pts": tp_pts,
         "trail_pts": trail_pts,
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": ist_now().strftime("%Y-%m-%d %H:%M:%S"),
         "status": "OPEN"
     }
+    position.update({key: value for key, value in (metadata or st.session_state.get("journal_draft", {})).items()
+                     if key in {"setup", "entry_reason", "source", "timeframe", "lesson", "auto_exit", "contract"}})
     pdata["positions"].append(position)
     save_paper_account(pdata)
     return True, f"Paper Order Placed! (ID: {position['id']})"
@@ -2791,6 +3117,9 @@ def evaluate_paper_positions(current_prices):
             continue
 
         ltp = current_prices[sym]
+        if _as_float(ltp) is None or ltp <= 0 or pos.get("auto_exit") is False:
+            still_open.append(pos)
+            continue
         closed = False
         exit_price = ltp
         reason = ""
@@ -2798,21 +3127,17 @@ def evaluate_paper_positions(current_prices):
         if pos["action"] == "BUY":
             if ltp >= pos["tp_price"]:
                 closed = True
-                exit_price = pos["tp_price"]
-                reason = "Target Hit (1:3)"
+                reason = "Target observed on feed snapshot"
             elif ltp <= pos["sl_price"]:
                 closed = True
-                exit_price = pos["sl_price"]
-                reason = "Stop Loss Hit"
+                reason = "Stop observed on feed snapshot"
         else:
             if ltp <= pos["tp_price"]:
                 closed = True
-                exit_price = pos["tp_price"]
-                reason = "Target Hit (1:3)"
+                reason = "Target observed on feed snapshot"
             elif ltp >= pos["sl_price"]:
                 closed = True
-                exit_price = pos["sl_price"]
-                reason = "Stop Loss Hit"
+                reason = "Stop observed on feed snapshot"
 
         if closed:
             closed_any = True
@@ -2822,7 +3147,7 @@ def evaluate_paper_positions(current_prices):
             pos["exit_price"] = exit_price
             pos["pnl"] = round(pnl, 2)
             pos["exit_reason"] = reason
-            pos["exit_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            pos["exit_time"] = ist_now().strftime("%Y-%m-%d %H:%M:%S")
             pdata["closed_trades"].append(pos)
         else:
             still_open.append(pos)
@@ -2830,6 +3155,71 @@ def evaluate_paper_positions(current_prices):
     if closed_any:
         pdata["positions"] = still_open
         save_paper_account(pdata)
+
+def render_paper_journal():
+    pdata = st.session_state["paper_data"]
+    trades = pdata.get("positions", []) + pdata.get("closed_trades", [])
+    with st.expander("Trade journal · reason, setup and lesson", expanded=True):
+        if not trades:
+            st.caption("Record a paper trade to start your journal.")
+        else:
+            lookup = {trade["id"]: trade for trade in trades}
+            trade_id = st.selectbox("Journal trade", list(lookup), format_func=lambda value: f"{lookup[value]['symbol']} · {lookup[value]['action']} · {value}", key="journal_trade")
+            trade = lookup[trade_id]
+            with st.form(f"journal_form_{trade_id}"):
+                setup_name = st.text_input("Setup", value=trade.get("setup", "Manual"), max_chars=120)
+                reason = st.text_area("Entry reason", value=trade.get("entry_reason", ""), max_chars=1000)
+                lesson = st.text_area("Review / lesson", value=trade.get("lesson", ""), max_chars=2000)
+                if st.form_submit_button("Save journal note"):
+                    trade.update(setup=setup_name, entry_reason=reason, lesson=lesson)
+                    save_paper_account(pdata)
+                    st.success("Journal note saved for this session.")
+            screenshot = st.file_uploader("Optional chart screenshot (PNG/JPG, up to 5 MB)", type=["png", "jpg", "jpeg"], key=f"journal_image_{trade_id}")
+            if screenshot:
+                if screenshot.size <= 5 * 1024 * 1024:
+                    st.session_state.setdefault("journal_images", {})[trade_id] = {"name": f"{trade_id}.{screenshot.name.rsplit('.', 1)[-1].lower()}", "data": screenshot.getvalue()}
+                    st.image(screenshot.getvalue(), width=320)
+                else:
+                    st.warning("Choose a screenshot smaller than 5 MB.")
+        st.download_button("Export paper journal (JSON)", json.dumps(pdata, indent=2), file_name="mahi-paper-journal.json", mime="application/json", key="export_journal")
+        if trades:
+            st.download_button("Export trade table (CSV)", pd.DataFrame(trades).to_csv(index=False), file_name="mahi-paper-trades.csv", mime="text/csv", key="export_journal_csv")
+        for trade_id, attachment in st.session_state.get("journal_images", {}).items():
+            st.download_button(f"Download screenshot · {trade_id}", attachment["data"], file_name=attachment["name"], key=f"download_journal_image_{trade_id}")
+    with st.expander("Setup performance · recorded paper trades", expanded=False):
+        closed = pdata.get("closed_trades", [])
+        if closed:
+            history = pd.DataFrame(closed)
+            history["setup"] = history.get("setup", pd.Series("Unlabelled", index=history.index)).fillna("Unlabelled")
+            metrics = []
+            for setup, group in history.groupby("setup"):
+                pnl = pd.to_numeric(group["pnl"], errors="coerce")
+                metrics.append({"Setup": setup, "Closed trades": len(group), "Wins": int((pnl > 0).sum()), "Losses": int((pnl < 0).sum()), "Gross P&L": float(pnl.sum()), "Average P&L": float(pnl.mean())})
+            st.dataframe(pd.DataFrame(metrics), hide_index=True, width="stretch")
+            st.caption(f"Sample: {len(closed)} closed paper trades. Results exclude costs and do not establish future reliability; small samples are especially uncertain.")
+        else:
+            st.caption("No completed paper trades yet. No performance statistics are estimated.")
+
+
+def render_trade_notes(symbol, setup, timeframe, source, auto_exit=True):
+    """Attach the trader's rationale to the next explicit paper submission."""
+    with st.expander("Trade note", expanded=False):
+        reason = st.text_area("Why this trade?", key=f"entry_reason_{symbol}", max_chars=1000)
+        setup_name = st.text_input("Setup name", value=str(setup or "Manual"), key=f"entry_setup_{symbol}", max_chars=120)
+    st.session_state["journal_draft"] = {"setup": setup_name, "entry_reason": reason,
+        "timeframe": timeframe, "source": source, "auto_exit": auto_exit}
+
+
+def render_risk_budget(planned_loss=None, is_paper=True):
+    limits = st.session_state.get("risk_budgets", {})
+    pdata = st.session_state.get("paper_data", {})
+    trades = pdata.get("positions", []) + pdata.get("closed_trades", []) if is_paper else []
+    result = risk_budget_warnings(planned_loss, trades, limits, ist_now().date())
+    for warning in result["warnings"]:
+        st.warning(warning)
+    if not is_paper:
+        st.caption("Per-trade budget is a planning check. Live daily losses and trade count must be checked against the broker account.")
+
 
 # --- Safe Secrets Loader ---
 try:
@@ -2901,10 +3291,7 @@ def connect_angel_one(api_key: str, client_code: str, pin: str, totp_secret: str
     except Exception as e:
         return None, str(e)
 
-if "smart_api" not in st.session_state and all([def_api_key, def_client_id, def_pin, def_totp]):
-    api_instance, _ = connect_angel_one(def_api_key, def_client_id, def_pin, def_totp)
-    if api_instance:
-        st.session_state["smart_api"] = api_instance
+# Saved owner credentials must never auto-connect every visitor of a public app.
 
 
 def _cached_broker_result(cache_key, ttl_seconds, fetcher):
@@ -3097,7 +3484,13 @@ def _render_fo_gate(gate):
 def _render_fo_risk_controls(selected_contract, option_snapshot, gate, is_paper_trading, live_orders_armed, broker_client):
     """Render a directional planning calculator and deliberately gated order actions."""
     if not option_snapshot.get("ok") or not gate.get("allow_risk_preview"):
-        st.info("A fresh selected-contract broker LTP is required before risk planning can be shown. No premium is estimated.")
+        st.info(f"Order entry needs this contract's broker premium. {option_snapshot.get('message') or 'Refresh the selected contract.'}")
+        missing_buy, missing_sell = st.columns(2)
+        missing_suffix = _fo_widget_suffix(selected_contract)
+        missing_mode = "PAPER" if is_paper_trading else "LIVE"
+        missing_buy.button(f"🟢 {missing_mode} BUY", disabled=True, width="stretch", key=f"missing_buy_{missing_suffix}")
+        missing_sell.button(f"🔴 {missing_mode} SELL", disabled=True, width="stretch", key=f"missing_sell_{missing_suffix}")
+        st.caption("Login success does not guarantee quote availability. No usable quote can mean session expiry, symbol/token mismatch, entitlement or broker data availability; market closure alone does not prove the cause.")
         return
     suffix = _fo_widget_suffix(selected_contract)
     minimum_step = _as_float(selected_contract.get("tick_size")) or 0.05
@@ -3124,7 +3517,10 @@ def _render_fo_risk_controls(selected_contract, option_snapshot, gate, is_paper_
         f"<div class='calc-box'><div class='calc-row'><span style='color:#94a3b8;'>Quantity:</span><strong>{int(lots)} lot × {selected_contract['lot_size']} = {option_quantity}</strong></div><div class='calc-row'><span style='color:#94a3b8;'>{premium_label}:</span><strong style='color:#00f2fe;'>₹{preview['gross_notional']:,.2f}</strong></div><div class='calc-row'><span style='color:#94a3b8;'>{option_action} entry / stop / target:</span><strong>₹{preview['entry_price']:.2f} / <span style='color:#fb7185'>₹{preview['stop_price']:.2f}</span> / <span style='color:#34d399'>₹{preview['target_price']:.2f}</span></strong></div><div class='calc-row'><span style='color:#94a3b8;'>Illustrative P&amp;L target / stop:</span><strong><span style='color:#34d399'>+₹{preview['target_pnl']:,.2f}</span> / <span style='color:#fb7185'>₹{preview['loss_pnl']:,.2f}</span></strong></div></div>",
         unsafe_allow_html=True,
     )
-    buy_locked = option_action == "BUY" and not gate.get("allow_long_entry")
+    render_trade_notes(selected_contract["symbol"], gate.get("decision", "Manual option plan"), "F&O intraday", "Angel One selected contract")
+    st.session_state["journal_draft"]["contract"] = dict(selected_contract)
+    render_risk_budget(abs(preview["loss_pnl"]), is_paper_trading)
+    buy_locked = not is_paper_trading and option_action == "BUY" and not gate.get("allow_long_entry")
     if buy_locked:
         st.warning(f"BUY is locked by the F&O Trade Gate: {gate.get('decision', 'WAIT / NEUTRAL')}. These are planning values only.")
     if is_paper_trading:
@@ -3136,7 +3532,7 @@ def _render_fo_risk_controls(selected_contract, option_snapshot, gate, is_paper_
             )
             (st.success if ok else st.error)(f"{'✅' if ok else '❌'} {message}")
         if option_action == "SELL":
-            st.caption("Paper SELL is a simulation of a short option. It is never enabled for live submission in this desk.")
+            st.caption("Paper SELL reserves the entry notional as a simplified simulation. This is not the broker's short-option margin calculation.")
         return
     if option_action == "SELL":
         st.warning("Live short-option submission is unavailable until an actual broker margin and product preflight is implemented. Gross premium is not treated as available capital.")
@@ -3189,7 +3585,7 @@ def build_fo_compact_index_overview(chart_timeframe):
     result_by_symbol = {str(row.get("Symbol")): row for _, row in results.iterrows()} if not results.empty else {}
     rows = []
     for index_name, spec in FO_INDEX_UNIVERSE.items():
-        result = result_by_symbol.get(spec["chart_symbol"], {})
+        result = result_by_symbol.get(spec["chart_symbol"].removesuffix(".NS").removesuffix(".BO"), {})
         price = _as_float(result.get("Price")) if hasattr(result, "get") else None
         change = _as_float(result.get("Chg%")) if hasattr(result, "get") else None
         buy_text = str(result.get("Buy") or "") if hasattr(result, "get") else ""
@@ -3369,6 +3765,10 @@ def render_fo_index_desk(is_paper_trading, live_orders_armed, compact=False):
     chain_contracts = [contract for pair in chain_pairs for contract in (pair.get("CE"), pair.get("PE")) if contract]
     chain_snapshot = get_fo_chain_for_ui(broker_client, selected_index, selected_expiry, chain_contracts)
     selected_snapshot = get_option_snapshot_for_ui(broker_client, selected_contract)
+    if selected_snapshot.get("ok"):
+        st.session_state.setdefault("broker_option_prices", {})[selected_contract["symbol"]] = selected_snapshot
+    else:
+        st.session_state.setdefault("broker_option_prices", {}).pop(selected_contract["symbol"], None)
     option_candle_snapshot = get_option_candles_for_ui(broker_client, selected_contract, fo_interval)
     option_candles = normalise_broker_option_candles(option_candle_snapshot.get("candles", [])) if option_candle_snapshot.get("ok") else pd.DataFrame()
     option_evidence = evaluate_intraday_option_evidence(option_candles, instrument_label="Selected option premium")
@@ -3378,6 +3778,19 @@ def render_fo_index_desk(is_paper_trading, live_orders_armed, compact=False):
     }
     underlying_candles = normalise_broker_option_candles(underlying_candle_snapshot.get("candles", [])) if underlying_candle_snapshot.get("ok") else pd.DataFrame()
     underlying_evidence = evaluate_intraday_option_evidence(underlying_candles, instrument_label="Underlying index")
+    premium_signal = detect_price_action_setup(option_candles, fo_interval)
+    underlying_completed, underlying_issue = completed_signal_candles(underlying_candles, fo_interval)
+    if not selected_snapshot.get("ok") or not underlying_snapshot.get("ok") or underlying_issue or len(underlying_completed) < 30:
+        premium_signal = dict(premium_signal, state="DATA REQUIRED", reasons=["Fresh broker index and selected-premium quotes plus sufficient completed index candles are required."])
+    else:
+        underlying_close = underlying_completed["Close"]
+        index_ema9 = underlying_close.ewm(span=9, adjust=False).mean().iloc[-1]
+        index_ema20 = underlying_close.ewm(span=20, adjust=False).mean().iloc[-1]
+        direction_agrees = (underlying_close.iloc[-1] > index_ema9 > index_ema20) if selected_side == "CE" else (underlying_close.iloc[-1] < index_ema9 < index_ema20)
+        if premium_signal["state"] == "BULLISH SETUP" and not direction_agrees:
+            premium_signal = dict(premium_signal, state="WAIT / NO CLEAN SETUP", reasons=premium_signal["reasons"] + ["Underlying direction does not confirm a long position in this option side."])
+    render_setup_signal(premium_signal, f"{selected_contract['symbol']} · premium setup")
+    st.caption("Bullish/bearish describes this option premium. A bearish index can support a long PE; it does not mean SELL PE. Technical evidence never sends an order.")
     composite_gate = build_fo_composite_gate(
         underlying_snapshot, underlying_evidence, selected_contract, option_gate, option_evidence,
     )
@@ -3400,7 +3813,7 @@ def render_fo_index_desk(is_paper_trading, live_orders_armed, compact=False):
         with index_metric_1:
             st.metric("Broker index LTP", _fo_currency(underlying_snapshot.get("ltp")))
         with index_metric_2:
-            st.metric("Broker state", "LIVE" if underlying_snapshot.get("ok") else "UNAVAILABLE")
+            st.metric("Broker state", "QUOTE RETURNED" if underlying_snapshot.get("ok") else "UNAVAILABLE")
         with index_metric_3:
             st.metric("Underlying gate", underlying_evidence.get("summary", {}).get("regime", "INSUFFICIENT_DATA"))
         chart_frame = underlying_candles if not underlying_candles.empty else public_chart
@@ -3492,10 +3905,73 @@ def render_fo_index_desk(is_paper_trading, live_orders_armed, compact=False):
         st.dataframe(pd.DataFrame(verification_rows), width="stretch", hide_index=True, key=f"fo5_verification_{_fo_widget_suffix(selected_contract)}_{fo_interval}")
 
 
+def fetch_broker_account_view(smart_api):
+    """Read order/position endpoints only; never submit, modify or cancel."""
+    result = {"orders": [], "positions": [], "errors": [], "fetched_at": ist_now().isoformat()}
+    if smart_api is None:
+        result["errors"] = ["Angel One is disconnected."]
+        return result
+    fields = {
+        "orders": {"orderid": "Order ID", "tradingsymbol": "Symbol", "exchange": "Exchange", "transactiontype": "Side", "ordertype": "Order type", "producttype": "Product", "status": "Status", "quantity": "Qty", "filledshares": "Filled qty", "unfilledshares": "Pending qty", "averageprice": "Average fill", "triggerprice": "SL trigger", "price": "Order price", "updatetime": "Updated"},
+        "positions": {"tradingsymbol": "Symbol", "exchange": "Exchange", "producttype": "Product", "netqty": "Net qty", "buyavgprice": "Buy average", "sellavgprice": "Sell average", "ltp": "LTP", "unrealised": "Unrealized P&L", "realised": "Realized P&L"},
+    }
+    for section, method in (("orders", "orderBook"), ("positions", "position")):
+        try:
+            if not callable(getattr(smart_api, method, None)):
+                result["errors"].append(f"Broker client does not support {section}.")
+                continue
+            reply = getattr(smart_api, method)()
+            if not isinstance(reply, dict) or reply.get("status") is not True:
+                result["errors"].append(f"Broker {section} request was not successful. Reconnect or check the broker app.")
+                continue
+            rows = reply.get("data") or []
+            if not isinstance(rows, list):
+                result["errors"].append(f"Broker {section} response has an unexpected format.")
+                continue
+            result[section] = [{label: row.get(key) for key, label in fields[section].items()} for row in rows if isinstance(row, dict)]
+        except Exception:
+            result["errors"].append(f"Broker {section} request failed. Reconnect and retry.")
+    return result
+
+
+def render_broker_status():
+    with st.expander("Broker orders & positions", expanded=False):
+        if st.button("↻ Read broker order book and positions", key="read_broker_account", disabled=st.session_state.get("smart_api") is None):
+            st.session_state["broker_account_view"] = fetch_broker_account_view(st.session_state.get("smart_api"))
+        snapshot = st.session_state.get("broker_account_view")
+        if not snapshot:
+            st.caption("Connect Angel One, then refresh to see actual fills, pending orders and position P&L.")
+        else:
+            st.caption(f"Read at {snapshot['fetched_at']} · this snapshot does not refresh automatically.")
+            for error in snapshot["errors"]:
+                st.warning(error)
+            for section in ("orders", "positions"):
+                st.markdown(f"**{section.title()}**")
+                if snapshot[section]:
+                    st.dataframe(pd.DataFrame(snapshot[section]), hide_index=True, width="stretch")
+                else:
+                    st.caption("No rows returned. Check any request error above.")
+            st.caption("SL trigger is shown only when returned on an order. Targets and protective orders are not inferred from a position or from planning inputs.")
+
+
+def render_data_health(candle_time=None, interval=None):
+    source_state = "Unavailable"
+    if candle_time:
+        try:
+            stamp = pd.Timestamp(candle_time)
+            stamp = stamp.tz_localize(IST_TIMEZONE) if stamp.tzinfo is None else stamp.tz_convert(IST_TIMEZONE)
+            source_state = stamp.strftime("%d %b %Y %H:%M IST")
+        except (ValueError, TypeError):
+            pass
+    session = "connected session · quote availability checked separately" if st.session_state.get("smart_api") is not None else "disconnected"
+    st.caption(f"Data health · public technical candles ({interval or 'timeframe unspecified'}) · latest source: {source_state}. Angel: {session}.")
+
+
 def live_order_is_armed():
     return bool(
         LIVE_ORDER_EXECUTION_ENABLED
         and st.session_state.get("live_orders_armed")
+        and st.session_state.get("live_order_acknowledgement")
         and st.session_state.get("smart_api") is not None
     )
 
@@ -3508,10 +3984,8 @@ def verify_live_broker_session(smart_api):
         response = smart_api.rmsLimit()
     except Exception as exc:
         return False, f"Broker session preflight failed: {exc}"
-    if isinstance(response, dict) and response.get("status") is False:
-        return False, response.get("message", "Broker rejected the session preflight.")
-    if response is None:
-        return False, "Broker session preflight returned no response."
+    if not isinstance(response, dict) or response.get("status") is not True:
+        return False, "Broker session preflight was not confirmed. Reconnect before submitting."
     return True, ""
 
 
@@ -3540,6 +4014,8 @@ def submit_live_order(smart_api, order_params):
         if isinstance(response_data, dict):
             order_id = str(response_data.get("orderid") or response_data.get("uniqueorderid") or "")
         order_id = order_id or str(response.get("orderid") or response.get("uniqueorderid") or "")
+        if not order_id:
+            return False, "Submission state unknown: broker returned no order ID. Check the broker order book before retrying.", response
         return True, "Order submitted to Angel One; submission is not a fill confirmation.", {"order_id": order_id, "response": response}
     if response:
         return True, "Order submitted to Angel One; submission is not a fill confirmation.", {"order_id": str(response), "response": response}
@@ -3736,97 +4212,13 @@ st.markdown(f"""<div class="header-box">
 </div>
 </div>""", unsafe_allow_html=True)
 
-# --- Execution Mode & Universe Selection Bar ---
-st.markdown("""
-<div class="universe-strip">
-    <div style="display:flex; justify-content:space-between; align-items:center;">
-        <span style="font-size:11px; font-weight:800; color:#00f2fe; text-transform:uppercase; letter-spacing:1px;">
-            🌐 Active Market Universe & Execution Mode
-        </span>
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
-if "force_index_basket_refresh" not in st.session_state:
-    st.session_state["force_index_basket_refresh"] = False
-
-u_col1, u_col2, u_col3, u_col4, u_col5 = st.columns([3.5, 3.5, 2.4, 1.6, 1.7])
-with u_col1:
-    selected_basket = st.selectbox("Select Asset Universe", list(FALLBACK_INDEX_BASKETS.keys()), label_visibility="collapsed", key="asset_universe")
-with u_col2:
-    selected_horizon = st.selectbox("Select Trading Horizon", list(HORIZON_MAP.keys()), label_visibility="collapsed", key="trading_horizon")
-with u_col3:
-    exec_env = st.selectbox("Execution Mode", ["📝 Paper Trading", "⚡ Live Broker"], label_visibility="collapsed", key="execution_mode")
-with u_col4:
-    if st.button("↻ Refresh list", width="stretch", key="refresh_index_membership"):
-        st.session_state["force_index_basket_refresh"] = True
-        load_active_index_basket.clear()
-        st.rerun()
-with u_col5:
-    if st.button("↻ Refresh data", width="stretch", key="refresh_verified_market_data"):
-        st.session_state["force_index_basket_refresh"] = True
-        st.cache_data.clear()
-        clear_all_short_lived_broker_cache()
-        st.rerun()
-
-current_ist = ist_now()
-force_index_basket_refresh = st.session_state.pop("force_index_basket_refresh", False)
-basket_snapshot = load_active_index_basket(
-    selected_basket,
-    current_ist.date().isoformat(),
-    force_index_basket_refresh,
-)
-if basket_snapshot["state"] == "official":
-    membership_text = (
-        f"Membership: {basket_snapshot['source']} · {basket_snapshot['count']} stocks · "
-        f"checked {basket_snapshot['checked_at']}"
-    )
-    if basket_snapshot.get("last_modified"):
-        membership_text += f" · publisher file: {basket_snapshot['last_modified']}"
-    st.caption(membership_text)
-    if basket_snapshot.get("error"):
-        st.caption(basket_snapshot["error"])
-elif basket_snapshot["state"] == "stale":
-    st.warning(
-        f"Official membership source could not refresh — using the last validated {basket_snapshot['count']}-stock "
-        f"list from {basket_snapshot['last_success_at']}. Membership may be stale. {basket_snapshot['error']}"
-    )
-elif basket_snapshot["state"] == "bundled_fallback":
-    st.warning(
-        f"Official membership source unavailable — using a bundled {basket_snapshot['count']}-symbol backup. "
-        f"It may be incomplete or stale. {basket_snapshot['error']}"
-    )
-elif basket_snapshot["state"] == "bundled":
-    st.info(
-        f"{selected_basket} is a bundled watchlist ({basket_snapshot['count']} symbols), not an automatically updated index list."
-    )
-else:
-    st.error(f"No verified membership list is available for {selected_basket}. {basket_snapshot['error']}")
-
-persist_c1, persist_c2 = st.columns([3, 7])
-with persist_c1:
-    if st.button("💾 Remember workspace", width="stretch", key="save_safe_ui_settings"):
-        save_error = save_safe_ui_settings({
-            "asset_universe": selected_basket,
-            "trading_horizon": selected_horizon,
-            "execution_mode": exec_env,
-            "chart_timeframe": st.session_state.get("chart_timeframe", "15 minute"),
-            "fo_interval": st.session_state.get("fo_interval", "5 minute"),
-            "fo5_index": st.session_state.get("fo5_index", "NIFTY 50"),
-            "fo5_interval": st.session_state.get("fo5_interval", "5 minute"),
-            "fo5_public_timeframe": st.session_state.get("fo5_public_timeframe", "15 minute"),
-            "fo5_band": st.session_state.get("fo5_band", "ATM ±5 strikes"),
-        })
-        if save_error:
-            st.error(save_error)
-        else:
-            st.success("Saved non-sensitive workspace settings. Broker credentials are not stored here.")
-with persist_c2:
-    st.caption("Refresh data clears delayed/public cache and broker snapshots, then reloads verified sources. Your broker session may still need a fresh login after expiry.")
-
-is_paper_trading = (exec_env == "📝 Paper Trading")
-live_orders_armed = live_order_is_armed()
-period, interval, extrema_order = HORIZON_MAP[selected_horizon]
+with st.sidebar:
+    st.caption("Session risk budgets · optional warnings")
+    risk_per_trade = st.number_input("Maximum planned loss per trade (₹)", min_value=0.0, value=0.0, step=100.0, key="risk_per_trade")
+    risk_daily_loss = st.number_input("Paper daily loss budget (₹)", min_value=0.0, value=0.0, step=100.0, key="risk_daily_loss")
+    risk_max_trades = st.number_input("Paper trades per day", min_value=0, value=0, step=1, key="risk_max_trades")
+    st.session_state["risk_budgets"] = {"per_trade": risk_per_trade, "daily_loss": risk_daily_loss, "max_trades": risk_max_trades}
+    st.caption("0 leaves a budget unset. Budgets warn; they do not submit or cancel orders. Paper results exclude charges and slippage.")
 
 # Main Tabs
 main_tab_equity, main_tab_fo, tab_paper_ledger, tab_backtest, tab_chart, tab_news = st.tabs([
@@ -3837,6 +4229,99 @@ main_tab_equity, main_tab_fo, tab_paper_ledger, tab_backtest, tab_chart, tab_new
     "📉 Technical S/R Charts",
     "🗞️ Market Brief & News"
 ])
+
+with main_tab_equity:
+    # --- Execution Mode & Universe Selection Bar ---
+    st.markdown("""
+    <div class="universe-strip">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+            <span style="font-size:11px; font-weight:800; color:#00f2fe; text-transform:uppercase; letter-spacing:1px;">
+                🌐 Active Market Universe & Execution Mode
+            </span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if "force_index_basket_refresh" not in st.session_state:
+        st.session_state["force_index_basket_refresh"] = False
+
+    u_col1, u_col2, u_col3, u_col4, u_col5 = st.columns([3.5, 3.5, 2.4, 1.6, 1.7])
+    with u_col1:
+        selected_basket = st.selectbox("Select Asset Universe", list(FALLBACK_INDEX_BASKETS.keys()), label_visibility="collapsed", key="asset_universe")
+    with u_col2:
+        selected_horizon = st.selectbox("Select Trading Horizon", list(HORIZON_MAP.keys()), label_visibility="collapsed", key="trading_horizon")
+    with u_col3:
+        exec_env = st.selectbox("Execution Mode", ["📝 Paper Trading", "⚡ Live Broker"], label_visibility="collapsed", key="execution_mode")
+    with u_col4:
+        if st.button("↻ Refresh list", width="stretch", key="refresh_index_membership"):
+            st.session_state["force_index_basket_refresh"] = True
+            load_active_index_basket.clear()
+            st.rerun()
+    with u_col5:
+        if st.button("↻ Refresh data", width="stretch", key="refresh_verified_market_data"):
+            st.session_state["force_index_basket_refresh"] = True
+            st.cache_data.clear()
+            clear_all_short_lived_broker_cache()
+            st.rerun()
+
+    current_ist = ist_now()
+    force_index_basket_refresh = st.session_state.pop("force_index_basket_refresh", False)
+    basket_snapshot = load_active_index_basket(
+        selected_basket,
+        current_ist.date().isoformat(),
+        force_index_basket_refresh,
+    )
+    if basket_snapshot["state"] == "official":
+        membership_text = (
+            f"Membership: {basket_snapshot['source']} · {basket_snapshot['count']} stocks · "
+            f"checked {basket_snapshot['checked_at']}"
+        )
+        if basket_snapshot.get("last_modified"):
+            membership_text += f" · publisher file: {basket_snapshot['last_modified']}"
+        st.caption(membership_text)
+        if basket_snapshot.get("error"):
+            st.caption(basket_snapshot["error"])
+    elif basket_snapshot["state"] == "stale":
+        st.warning(
+            f"Official membership source could not refresh — using the last validated {basket_snapshot['count']}-stock "
+            f"list from {basket_snapshot['last_success_at']}. Membership may be stale. {basket_snapshot['error']}"
+        )
+    elif basket_snapshot["state"] == "bundled_fallback":
+        st.warning(
+            f"Official membership source unavailable — using a bundled {basket_snapshot['count']}-symbol backup. "
+            f"It may be incomplete or stale. {basket_snapshot['error']}"
+        )
+    elif basket_snapshot["state"] == "bundled":
+        st.info(
+            f"{selected_basket} is a bundled watchlist ({basket_snapshot['count']} symbols), not an automatically updated index list."
+        )
+    else:
+        st.error(f"No verified membership list is available for {selected_basket}. {basket_snapshot['error']}")
+
+    persist_c1, persist_c2 = st.columns([3, 7])
+    with persist_c1:
+        if st.button("💾 Remember workspace", width="stretch", key="save_safe_ui_settings"):
+            save_error = save_safe_ui_settings({
+                "asset_universe": selected_basket,
+                "trading_horizon": selected_horizon,
+                "execution_mode": exec_env,
+                "chart_timeframe": st.session_state.get("chart_timeframe", "15 minute"),
+                "fo_interval": st.session_state.get("fo_interval", "5 minute"),
+                "fo5_index": st.session_state.get("fo5_index", "NIFTY 50"),
+                "fo5_interval": st.session_state.get("fo5_interval", "5 minute"),
+                "fo5_public_timeframe": st.session_state.get("fo5_public_timeframe", "15 minute"),
+                "fo5_band": st.session_state.get("fo5_band", "ATM ±5 strikes"),
+            })
+            if save_error:
+                st.error(save_error)
+            else:
+                st.success("Saved non-sensitive workspace settings. Broker credentials are not stored here.")
+    with persist_c2:
+        st.caption("Refresh data clears delayed/public cache and broker snapshots, then reloads verified sources. Your broker session may still need a fresh login after expiry.")
+
+    is_paper_trading = (exec_env == "📝 Paper Trading")
+    live_orders_armed = live_order_is_armed()
+    period, interval, extrema_order = HORIZON_MAP[selected_horizon]
 
 # =========================================================================
 # TAB 1: EQUITY INTELLIGENCE (10-POINT STRATEGY + 1:3 RISK-TO-REWARD ENGINE)
@@ -3879,9 +4364,23 @@ with main_tab_equity:
         st.caption("Daily public chart data is unavailable; the macro check, where shown, explicitly uses the intraday 50 EMA fallback.")
 
     df_results, checklists, current_live_prices = evaluate_equity_intelligence_scan(
-        symbols, data, daily_data, extrema_order,
+        symbols, data, daily_data, extrema_order, interval=interval,
     )
-    evaluate_paper_positions(current_live_prices)
+    # Only current-session intraday observations may trigger a simulated exit.
+    # Historical daily/weekly closes are context, not executable current prices.
+    paper_observations = {}
+    if interval.endswith("m"):
+        for symbol in symbols:
+            frame = _market_frame_for_symbol(data, symbol)
+            if frame.empty:
+                continue
+            stamp = pd.Timestamp(frame.index[-1])
+            stamp = stamp.tz_localize("Asia/Kolkata") if stamp.tzinfo is None else stamp.tz_convert("Asia/Kolkata")
+            age = (pd.Timestamp(ist_now()) - stamp).total_seconds()
+            if stamp.date() == ist_now().date() and 0 <= age <= (int(interval[:-1]) + 5) * 60:
+                clean = symbol.removesuffix(".NS").removesuffix(".BO")
+                paper_observations[clean] = current_live_prices.get(clean)
+    evaluate_paper_positions(paper_observations)
 
     filtered_df = df_results.copy()
     if setup_filter != "All setups":
@@ -3924,6 +4423,8 @@ with main_tab_equity:
 
         if active_sym and active_sym in checklists:
             stock = checklists[active_sym]
+            render_data_health(stock.get("candle_time"), interval)
+            render_setup_signal(stock.get("signal", {}))
             chg_c = "#34d399" if stock['chg'] >= 0 else "#fb7185"
 
             atr_val = stock['atr']
@@ -3941,9 +4442,19 @@ with main_tab_equity:
                 key=f"equity_preview_side_{active_sym}",
                 help="Choose BUY or SELL first: the entry, stop, target, P&L, confirmation, and submit button below all use this one side.",
             )
-            inspector_preview = calculate_directional_preview(
-                preview_action, stock['ltp'], stop_points, target_points, 1
-            )
+            preview_entry = st.session_state.get(f"limit_{active_sym}", stock['ltp'])
+            try:
+                if equity_trade_policy["long_term"]:
+                    inspector_preview = calculate_investment_plan(preview_entry,
+                        st.session_state.get(f"investment_sl_{active_sym}", max(.01, preview_entry-stop_points)),
+                        st.session_state.get(f"investment_tp_{active_sym}", preview_entry+target_points), 1)
+                else:
+                    inspector_preview = calculate_directional_preview(preview_action, preview_entry,
+                        st.session_state.get(f"sl_{active_sym}", stop_points),
+                        st.session_state.get(f"tp_{active_sym}", target_points), 1)
+                inspector_levels = f"{preview_action} plan SL <span style='color:#fb7185'>₹{inspector_preview['stop_price']:.2f}</span> · target <span style='color:#34d399'>₹{inspector_preview['target_price']:.2f}</span>"
+            except ValueError:
+                inspector_levels = "Check stop and target values in the planner below."
 
             items_html = evidence_items_html(stock['checks'])
 
@@ -3961,13 +4472,12 @@ with main_tab_equity:
                     </span>
                 </div>
                 <div style="display:flex; justify-content:space-between; font-size:12px; margin: 10px 0; padding: 8px 12px; background:rgba(30, 41, 59, 0.6); border-radius:6px;">
-                    <div>VWAP: <strong style="color:#00f2fe">₹{stock['vwap']:.2f}</strong></div>
+                    <div>VWAP: <strong style="color:#00f2fe">{_fo_currency(stock['vwap'])}</strong></div>
                     <div>ORB HIGH: <strong style="color:#fbbf24">₹{stock['orb_high']:.2f}</strong></div>
                     <div>ATR(14): <strong>₹{atr_val:.2f}</strong></div>
                 </div>
                 <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom: 12px; padding: 8px 12px; background:rgba(15, 23, 42, 0.7); border:1px solid rgba(255,255,255,0.06); border-radius:6px;">
-                    <div>{preview_action} SL PRICE: <strong style="color:#fb7185">₹{inspector_preview['stop_price']:.2f}</strong></div>
-                    <div>{preview_action} TARGET (1:3): <strong style="color:#34d399">₹{inspector_preview['target_price']:.2f}</strong></div>
+                    <div>{inspector_levels}</div>
                 </div>
                 <div style="font-size:11px; font-weight:700; color:#94a3b8; text-transform:uppercase; margin-bottom:6px; letter-spacing:0.5px;">
                     EVIDENCE: <span style="color:#34d399;">{stock['buy_score']} BUY</span> &nbsp;·&nbsp; <span style="color:#fb7185;">{stock['sell_score']} SELL</span> &nbsp;·&nbsp; <span style="color:#fbbf24;">{stock['evidence_summary']['neutral_count']} NEUTRAL</span>
@@ -3985,7 +4495,7 @@ with main_tab_equity:
 
             if equity_trade_policy["long_term"]:
                 order_mode = "Regular Market"
-                st.info("Long Term is long-only for new positions: DELIVERY BUY only. New short/SELL and ROBO controls are deliberately hidden.")
+                st.caption("Long-term delivery BUY · stop and target below are an editable investment plan.")
             else:
                 order_mode = st.radio("Order Type", ["Bracket (ROBO Auto-Exit)", "Regular Market"], horizontal=True, label_visibility="collapsed", key=f"mode_{active_sym}")
 
@@ -3993,7 +4503,9 @@ with main_tab_equity:
             with calc_c1:
                 trade_qty = st.number_input("Quantity", min_value=1, value=10, step=1, key=f"qty_{active_sym}")
             with calc_c2:
-                trade_limit = st.number_input("Entry Price (₹)", value=float(round(stock['ltp'], 2)), step=0.5, key=f"limit_{active_sym}")
+                trade_limit = st.number_input("Entry Price (₹)", min_value=0.01, value=float(round(stock['ltp'], 2)), step=0.5, key=f"limit_{active_sym}")
+
+            render_trade_notes(active_sym, stock.get("signal", {}).get("pattern") or stock["setup"], selected_horizon, "Public chart context / user entry plan", auto_exit=not equity_trade_policy["long_term"])
 
             if order_mode == "Bracket (ROBO Auto-Exit)":
                 sl_c, tp_c, trail_c = st.columns(3)
@@ -4010,6 +4522,7 @@ with main_tab_equity:
                     st.error(f"Sizing needs valid values: {exc}")
 
                 if equity_preview:
+                    render_risk_budget(abs(equity_preview["loss_pnl"]), is_paper_trading)
                     total_notional = equity_preview["gross_notional"]
                     expected_profit = equity_preview["target_pnl"]
                     expected_loss = abs(equity_preview["loss_pnl"])
@@ -4058,6 +4571,28 @@ with main_tab_equity:
                             else:
                                 st.error(f"Live order was not submitted: {message}")
             else:
+                plan_valid = True
+                paper_stop_points, paper_target_points = stop_points, target_points
+                if equity_trade_policy["long_term"]:
+                    plan_sl, plan_target = st.columns(2)
+                    with plan_sl:
+                        investment_stop = st.number_input("Stop-loss / risk exit (₹)", min_value=0.01,
+                            value=round(max(0.01, trade_limit - stop_points), 2), step=0.5, key=f"investment_sl_{active_sym}")
+                    with plan_target:
+                        investment_target = st.number_input("Target / review price (₹)", min_value=0.01,
+                            value=round(trade_limit + target_points, 2), step=0.5, key=f"investment_tp_{active_sym}")
+                    try:
+                        investment_plan = calculate_investment_plan(trade_limit, investment_stop, investment_target, trade_qty)
+                        paper_stop_points = trade_limit - investment_stop
+                        paper_target_points = investment_target - trade_limit
+                        st.markdown(f"<div class='calc-box'><div class='calc-row'><span>Stop / target distance</span><strong style='color:#fbbf24'>−{investment_plan['stop_percent']:.2f}% / +{investment_plan['target_percent']:.2f}%</strong></div><div class='calc-row'><span>Planned loss</span><strong style='color:#fb7185'>₹{abs(investment_plan['loss_pnl']):,.2f}</strong></div><div class='calc-row'><span>Potential profit</span><strong style='color:#34d399'>₹{investment_plan['target_pnl']:,.2f}</strong></div><div class='calc-row'><span>Risk : reward</span><strong>1 : {investment_plan['target_pnl'] / abs(investment_plan['loss_pnl']):.2f}</strong></div></div>", unsafe_allow_html=True)
+                        render_risk_budget(abs(investment_plan["loss_pnl"]), is_paper_trading)
+                    except ValueError as exc:
+                        plan_valid = False
+                        st.error(str(exc))
+                    st.caption("Planning only: these levels do not create broker SL/target orders or automatic paper exits. Review and exit the delivery holding separately. P&L excludes costs and gaps.")
+                else:
+                    render_risk_budget(trade_qty * stop_points, is_paper_trading)
                 regular_notional = trade_qty * trade_limit
                 notional_label = "Total delivery amount" if equity_trade_policy["long_term"] else ("Estimated buy value" if preview_action == "BUY" else "Estimated sale value — broker margin not calculated")
                 st.markdown(f"""<div class="calc-box"><div class="calc-row"><span style="color:#94a3b8;">{notional_label}:</span><strong style="color:#ffffff; font-size:14px;">₹{regular_notional:,.2f}</strong></div><div class="calc-row"><span style="color:#94a3b8;">Sizing side:</span><strong style="color:{'#34d399' if preview_action == 'BUY' else '#fb7185'};">{preview_action}</strong></div></div>""", unsafe_allow_html=True)
@@ -4079,11 +4614,11 @@ with main_tab_equity:
                 action_marker = "🟢" if preview_action == "BUY" else "🔴"
                 submit_market = st.button(
                     f"{action_marker} {market_prefix} {preview_action} MARKET {active_sym}", width="stretch", key=market_key,
-                    disabled=not is_paper_trading and not (live_orders_armed and live_confirm),
+                    disabled=not plan_valid or (not is_paper_trading and not (live_orders_armed and live_confirm)),
                 )
                 if submit_market:
                     if is_paper_trading:
-                        ok, msg = place_paper_order(active_sym, preview_action, trade_qty, trade_limit, stop_points, target_points)
+                        ok, msg = place_paper_order(active_sym, preview_action, trade_qty, trade_limit, paper_stop_points, paper_target_points)
                         (st.success if ok else st.error)(f"{'✅' if ok else '❌'} {msg}")
                     else:
                         with st.spinner("Resolving broker contract and submitting your confirmed market order..."):
@@ -4097,15 +4632,16 @@ with main_tab_equity:
                             st.success(f"✅ LIVE market order submitted to Angel One{f' · Order ID: {order_id}' if order_id else ''}. Check the broker order book for final status.")
                             if broker_ltp and broker_ltp.get("ok"):
                                 st.caption(f"Broker LTP verified at submission: ₹{broker_ltp['ltp']:.2f}")
-                            else:
-                                st.error(f"Live order was not submitted: {message}")
+                        else:
+                            st.error(f"Live order was not submitted: {message}")
 
 
 # =========================================================================
 # TAB 2: FOCUSED FIVE-INDEX F&O INTRADAY DESK
 # =========================================================================
 with main_tab_fo:
-    render_fo_index_desk(is_paper_trading, live_orders_armed, compact=True)
+    fo_exec_env = st.selectbox("F&O execution mode", ["📝 Paper Trading", "⚡ Live Broker"], key="fo_execution_mode")
+    render_fo_index_desk(fo_exec_env == "📝 Paper Trading", live_orders_armed, compact=True)
 
 # Previous generic-contract table retained as unreachable reference while the
 # focused five-index desk above is tested. It must not render or fetch data.
@@ -4569,6 +5105,16 @@ if False:
 # =========================================================================
 with tab_paper_ledger:
     pdata = st.session_state["paper_data"]
+    st.caption("Private browser-session paper account. Export the journal before a browser/session reset; old local paper_trades.json files are not loaded or overwritten.")
+    render_risk_budget(is_paper=True)
+    if st.button("↻ Refresh open F&O paper quotes", key="refresh_paper_fo_quotes", disabled=st.session_state.get("smart_api") is None):
+        for position in pdata.get("positions", [])[:30]:
+            contract = position.get("contract")
+            if not contract:
+                continue
+            snapshot = fetch_selected_option_snapshot(st.session_state.get("smart_api"), contract)
+            st.session_state.setdefault("broker_option_prices", {})[position["symbol"]] = snapshot
+        st.caption("Refreshed up to 30 recorded option contracts. Quote snapshots do not guarantee an executable fill.")
     
     total_invested = sum(p["qty"] * p["entry_price"] for p in pdata["positions"])
     cur_equity = pdata["cash"] + total_invested
@@ -4577,7 +5123,7 @@ with tab_paper_ledger:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Virtual Cash Balance", f"₹{pdata['cash']:,.2f}")
     c2.metric("Capital in Active Trades", f"₹{total_invested:,.2f}")
-    c3.metric("Net Virtual Portfolio", f"₹{cur_equity:,.2f}")
+    c3.metric("Virtual capital at cost", f"₹{cur_equity:,.2f}")
     c4.metric("Total Realized P&L", f"{total_realized_pnl:+,.2f}", delta=f"{((cur_equity-500000)/500000)*100:+.2f}%")
 
     st.write("")
@@ -4587,7 +5133,7 @@ with tab_paper_ledger:
         open_rows = []
         for p in pdata["positions"]:
             sym = p["symbol"]
-            cur_price = current_live_prices.get(sym)
+            cur_price = paper_observations.get(sym)
             if cur_price is None:
                 broker_snapshot = st.session_state.get("broker_option_prices", {}).get(sym, {})
                 snapshot_age = time.time() - broker_snapshot.get("fetched_at", 0)
@@ -4621,6 +5167,21 @@ with tab_paper_ledger:
             }
         )
         st.caption("Blank LTP and P&L cells mean no fresh quote is available for that position; the app does not reuse the entry price as a market price.")
+        with st.expander("Close a paper position"):
+            close_options = {row["ID"]: row for row in open_rows}
+            close_id = st.selectbox("Position to close", list(close_options), format_func=lambda value: f"{close_options[value]['Symbol']} · {value}", key="paper_close_id")
+            close_row = close_options[close_id]
+            close_price = close_row["LTP (₹)"]
+            st.caption("Simulated exit uses the displayed available-feed quote. It sends no broker order; costs and slippage are not simulated.")
+            if st.button("Close paper position at displayed quote", disabled=close_price is None, key="close_paper_at_quote"):
+                position = next(p for p in pdata["positions"] if p["id"] == close_id)
+                pnl = (close_price-position["entry_price"])*position["qty"]*(1 if position["action"] == "BUY" else -1)
+                position.update(status="CLOSED", exit_price=close_price, pnl=round(pnl, 2), exit_reason="Manual simulated exit at feed snapshot", exit_time=ist_now().strftime("%Y-%m-%d %H:%M:%S"))
+                pdata["cash"] += position["qty"] * position["entry_price"] + pnl
+                pdata["positions"] = [p for p in pdata["positions"] if p["id"] != close_id]
+                pdata["closed_trades"].append(position)
+                save_paper_account(pdata)
+                st.rerun()
     else:
         st.info("No active paper positions. Place bracket orders from Tab 1 or Tab 2 to start testing.")
 
@@ -4639,7 +5200,7 @@ with tab_paper_ledger:
             }
         )
     else:
-        st.caption("Closed trades will automatically populate here as Target or Stop-Loss boundaries are triggered.")
+        st.caption("Intraday equity paper exits are checked on available recent feed snapshots during app runs. F&O and long-term paper plans can be closed manually above. Nothing is monitored while the app is asleep.")
 
     if st.button("🔄 Reset Paper Trading Account to ₹5,00,000"):
         st.session_state["paper_data"] = {
@@ -4648,7 +5209,10 @@ with tab_paper_ledger:
             "closed_trades": []
         }
         save_paper_account(st.session_state["paper_data"])
+        st.session_state.pop("journal_images", None)
         st.rerun()
+
+    render_paper_journal()
 
 # =========================================================================
 # TAB 4: BACKTEST ENGINE
@@ -4670,8 +5234,7 @@ with tab_backtest:
             raw, backtest_feed_message = download_public_chart_data(
                 bt_sym, period=f"{bt_years}y", interval="1d", progress=False,
             )
-            if isinstance(raw.columns, pd.MultiIndex):
-                raw.columns = raw.columns.get_level_values(0)
+            raw = _market_frame_for_symbol(raw, bt_sym)
             raw.dropna(inplace=True)
 
             if backtest_feed_message:
@@ -4744,8 +5307,7 @@ with tab_chart:
         st.markdown("</div>", unsafe_allow_html=True)
 
     c_raw, chart_feed_message = download_public_chart_data(c_sym, period=chart_period, interval=chart_interval, progress=False)
-    if isinstance(c_raw.columns, pd.MultiIndex):
-        c_raw.columns = c_raw.columns.get_level_values(0)
+    c_raw = _market_frame_for_symbol(c_raw, c_sym)
     c_raw = c_raw.dropna().copy()
 
     if chart_feed_message:
@@ -4807,116 +5369,61 @@ with tab_chart:
 # TAB 6: MARKET BRIEF & OFFICIAL NEWS CONTEXT
 # =========================================================================
 with tab_news:
-    st.markdown("<h3 style='color:#fff; margin-bottom:4px;'>Mahi Morning Brief</h3>", unsafe_allow_html=True)
-    st.caption("A source-attributed market context board inspired by your sample report. It is information for review, not a BUY/SELL tip engine or a promise of market direction.")
+    st.subheader("Market in 30 Seconds")
+    st.caption("Latest available market context · source dates shown on every hint.")
 
     @st.cache_data(ttl=600, show_spinner=False)
     def load_official_market_news():
         return fetch_official_news_feeds(OFFICIAL_NEWS_SOURCES)
 
     @st.cache_data(ttl=300, show_spinner=False)
-    def load_global_market_watch():
-        return download_public_chart_data(
-            list(GLOBAL_MARKET_WATCH.values()), period="5d", interval="1d", group_by="ticker", progress=False, threads=True,
-        )
+    def load_brief_index_context():
+        market_symbols = {"NIFTY 50": "^NSEI", "BANKNIFTY": "^NSEBANK", "SENSEX": "^BSESN", **GLOBAL_MARKET_WATCH}
+        raw, error = download_public_chart_data(list(market_symbols.values()), period="5d", interval="1d", group_by="ticker", progress=False, threads=True)
+        return build_brief_market_rows(raw, market_symbols), error
 
-    news_button_col, schedule_note_col = st.columns([2.2, 7.8])
-    with news_button_col:
-        if st.button("↻ Refresh brief", width="stretch", key="refresh_morning_brief"):
-            load_official_market_news.clear()
-            load_global_market_watch.clear()
-            st.rerun()
-    with schedule_note_col:
-        st.caption("The in-app brief refreshes when opened. Automatic pre-market delivery is intentionally not enabled until you choose a delivery channel and schedule.")
-
-    # Today's verified watchlist breadth is drawn from the same delayed public
-    # data used by the Equity tab; unavailable rows never become zero values.
-    brief_rows = df_results.copy() if isinstance(df_results, pd.DataFrame) else pd.DataFrame()
-    if not brief_rows.empty:
-        advancing = int((brief_rows["Chg%"] > 0).sum())
-        declining = int((brief_rows["Chg%"] < 0).sum())
-        unchanged = int((brief_rows["Chg%"] == 0).sum())
-        technical_bullish = int((brief_rows["Setup"] == "BUY_SETUP").sum())
-        technical_bearish = int((brief_rows["Setup"] == "BEARISH_SETUP").sum())
-        technical_neutral = len(brief_rows) - technical_bullish - technical_bearish
-        breadth_text = f"{advancing} advancing · {declining} declining · {unchanged} unchanged"
-        technical_text = f"{technical_bullish} bullish evidence · {technical_bearish} bearish evidence · {technical_neutral} no-trade/mixed"
-    else:
-        breadth_text = "Unavailable — no verified constituent chart rows"
-        technical_text = "Unavailable — no technical evidence rows"
-
-    brief_1, brief_2, brief_3 = st.columns(3)
-    with brief_1:
-        st.markdown(f"<div class='brief-card'><div class='brief-kicker'>Universe breadth</div><div class='brief-value'>{selected_basket}</div><div class='brief-note'>{breadth_text}</div></div>", unsafe_allow_html=True)
-    with brief_2:
-        st.markdown(f"<div class='brief-card'><div class='brief-kicker'>Technical evidence</div><div class='brief-value'>Review, don’t predict</div><div class='brief-note'>{technical_text}</div></div>", unsafe_allow_html=True)
-    with brief_3:
-        st.markdown(f"<div class='brief-card'><div class='brief-kicker'>Data freshness</div><div class='brief-value'>{ist_now().strftime('%H:%M')} IST</div><div class='brief-note'>Index membership: {html.escape(str(basket_snapshot['state']))}. Public chart data may be delayed; broker snapshots are labelled separately.</div></div>", unsafe_allow_html=True)
-
-    st.markdown("<h4 style='color:#fff; margin:22px 0 8px;'>Official India Market Bulletin</h4>", unsafe_allow_html=True)
+    if st.button("↻ Refresh brief", key="refresh_morning_brief"):
+        load_official_market_news.clear()
+        load_brief_index_context.clear()
+        st.rerun()
     news_snapshot = load_official_market_news()
-    if news_snapshot["items"]:
-        source_category = {row["name"]: row["category"] for row in OFFICIAL_NEWS_SOURCES}
-        for news_item in news_snapshot["items"]:
-            category = source_category.get(news_item["source"], "Official update")
-            news_col, open_col = st.columns([8.2, 1.8])
-            with news_col:
-                st.markdown(f"**[{html.escape(category)}] {html.escape(news_item['title'])}**")
-                st.caption(f"{news_item['source']} · published {news_item['published'] or 'time not supplied by feed'}")
-            with open_col:
-                st.link_button("Open original", news_item["link"], width="stretch", key=f"official_news_{news_item['source']}_{hashlib.sha1(news_item['title'].encode()).hexdigest()[:10]}")
-    else:
-        st.info("Official news feeds have not returned readable headlines. No headline or analysis is substituted.")
-    if news_snapshot["errors"]:
-        st.caption("Feed status: " + " | ".join(news_snapshot["errors"]))
-    else:
-        st.caption(f"Official-feed snapshot fetched {news_snapshot['fetched_at']}. Headlines are links only; article text is not copied.")
-
-    st.markdown("<h4 style='color:#fff; margin:22px 0 8px;'>Global Market Context</h4>", unsafe_allow_html=True)
-    global_raw, global_error = load_global_market_watch()
-    global_rows = []
-    if not global_error:
-        for market_name, ticker in GLOBAL_MARKET_WATCH.items():
-            try:
-                market_frame = global_raw[ticker] if isinstance(global_raw.columns, pd.MultiIndex) else global_raw
-                market_frame = market_frame.dropna(subset=["Close"])
-                if len(market_frame) < 2:
-                    continue
-                latest = float(market_frame["Close"].iloc[-1])
-                previous = float(market_frame["Close"].iloc[-2])
-                global_rows.append({"Market": market_name, "Last close": latest, "Change": latest - previous, "Change %": (latest - previous) / previous * 100})
-            except (KeyError, TypeError, ValueError, IndexError):
-                continue
-    if global_rows:
-        st.dataframe(
-            pd.DataFrame(global_rows), width="stretch", hide_index=True,
-            column_config={
-                "Last close": st.column_config.NumberColumn(format="%.2f"),
-                "Change": st.column_config.NumberColumn(format="%+.2f"),
-                "Change %": st.column_config.NumberColumn(format="%+.2f%%"),
-            },
-        )
-        st.caption("Public end-of-day/global snapshot; it is context only and may not reflect the Indian cash-market open.")
-    else:
-        st.info(f"Global public market snapshot unavailable. {global_error or 'No usable rows returned.'}")
-
-    st.markdown("<h4 style='color:#fff; margin:22px 0 8px;'>Professional Pre-Market Routine</h4>", unsafe_allow_html=True)
-    routine_col_1, routine_col_2 = st.columns(2)
-    with routine_col_1:
-        st.markdown("""
-        <div class='brief-card'>
-          <div class='brief-kicker'>Before market open</div>
-          <div class='brief-note'>1. Check data timestamps and official announcements.<br>2. Mark only liquid symbols and planned levels.<br>3. Set your own maximum loss and maximum number of trades before the first order.<br>4. Write the entry, invalidation, and reason before acting.</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with routine_col_2:
-        st.markdown("""
-        <div class='brief-card'>
-          <div class='brief-kicker'>During and after market</div>
-          <div class='brief-note'>5. Treat a mixed/sideways evidence panel as permission to wait.<br>6. Do not turn a news headline into an automatic trade.<br>7. Record execution, stop, exit, and rule-following in the journal.<br>8. Review a meaningful sample of trades before changing a rule.</div>
-        </div>
-        """, unsafe_allow_html=True)
-    st.caption("Official feed sources currently loaded: SEBI, RBI, and PIB. NSE's corporate RSS directory can be added once a stable machine-readable endpoint is verified. For major global breaking-news coverage, use a provider with a display/redistribution licence rather than scraping publisher pages.")
+    brief_markets, brief_market_error = load_brief_index_context()
+    quick = build_market_quick_brief(news_snapshot.get("items", []), brief_markets)
+    st.markdown(f"<div class='brief-card'><div class='brief-kicker'>Market mood · latest source session</div><div class='brief-value'>{html.escape(quick['mood'])}</div><div class='brief-note'>{html.escape(quick['reason'])}</div></div>", unsafe_allow_html=True)
+    st.caption("Mood describes the available Indian index snapshot. It does not predict the next session. Public prices may be delayed; news impact can differ by sector.")
+    for column, group, title, empty in zip(st.columns(3),
+        ("good", "bad", "watch"),
+        ("🟢 Good news / positive cues", "🔴 Bad news / negative cues", "🟡 Watch today"),
+        ("No recent positive cue verified in these sources.", "No recent negative cue verified in these sources.", "No recent market-wide event verified in these sources.")):
+        with column:
+            st.markdown(f"#### {title}")
+            for hint in quick["groups"][group]:
+                render_brief_hint(hint)
+            if not quick["groups"][group]:
+                st.caption(empty)
+    st.caption("Headline cues are conservative interpretations of the linked titles. Official feeds are limited coverage; an empty card does not mean nothing happened.")
+    with st.expander("Full official news"):
+        for item in news_snapshot.get("items", []):
+            render_brief_hint({"text": item["title"], "detail": f"{item['source']} · {item.get('published') or 'Publication time unavailable'}", "link": item["link"]})
+        if not news_snapshot.get("items"):
+            st.info("No readable official headlines returned.")
+        st.caption(f"Feed checked: {news_snapshot.get('fetched_at', 'Unavailable')} · {quick['older_news']} undated/older items excluded from the short brief.")
+        for error in news_snapshot.get("errors", []):
+            st.caption(error)
+    with st.expander("Indian and global market snapshots"):
+        if brief_markets:
+            st.dataframe(pd.DataFrame(brief_markets)[["Market", "Last price", "Change %", "Source session"]],
+                hide_index=True, width="stretch", column_config={
+                    "Last price": st.column_config.NumberColumn(format="%.2f"),
+                    "Change %": st.column_config.NumberColumn(format="%+.2f%%")})
+            st.caption("Daily bars can still be forming during that market's session. Different markets may have different source dates.")
+        else:
+            st.info("Market snapshot unavailable.")
+        if brief_market_error:
+            st.caption(brief_market_error)
+    with st.expander("My pre-market checklist"):
+        st.markdown("1. Check source times and overnight developments.\n2. Mark entry, invalidation and target levels.\n3. Set a risk budget and record your trade reason.\n4. Review fills and journal the outcome.")
+    st.caption("Official news sources: SEBI, RBI and PIB. Global context uses public chart snapshots. This brief refreshes in the app; scheduled delivery is not configured.")
 
 # =========================================================================
 # BOTTOM SECTION: ANGEL ONE GATEWAY
@@ -4931,11 +5438,11 @@ st.markdown("""
 
 ao_c1, ao_c2 = st.columns(2)
 with ao_c1:
-    ao_api_key = st.text_input("API Key", value=def_api_key, type="password", placeholder="API Key")
-    ao_client = st.text_input("Client ID", value=def_client_id, placeholder="Client Code")
+    ao_api_key = st.text_input("API Key", type="password", placeholder="API Key")
+    ao_client = st.text_input("Client ID", placeholder="Client Code")
 with ao_c2:
-    ao_pin = st.text_input("MPIN", value=def_pin, type="password", placeholder="MPIN")
-    ao_totp_key = st.text_input("TOTP Secret Key", value=def_totp, type="password", placeholder="Secret Key")
+    ao_pin = st.text_input("MPIN", type="password", placeholder="MPIN")
+    ao_totp_key = st.text_input("TOTP Secret Key", type="password", placeholder="Secret Key")
 
 ao_btn_col, ao_status_col = st.columns([1.5, 2.5])
 with ao_btn_col:
@@ -4945,8 +5452,10 @@ with ao_btn_col:
             if api_obj:
                 st.session_state["smart_api"] = api_obj
                 st.session_state["live_orders_armed"] = False
+                st.session_state["live_order_acknowledgement"] = False
+                st.session_state.pop("broker_account_view", None)
                 clear_all_short_lived_broker_cache()
-                st.success("Broker session connected. Live controls remain locked until you explicitly arm them below.")
+                st.rerun()
             else:
                 st.error(f"Failed: {res_msg}")
         else:
@@ -4957,13 +5466,60 @@ with ao_status_col:
     else:
         st.markdown("<span style='color:#94a3b8; font-size:13px; font-weight:500; line-height:38px;'>Status: Disconnected</span>", unsafe_allow_html=True)
 
-st.caption("For a restart-friendly local setup, you may place credentials yourself in `.streamlit/secrets.toml` under `angel_one`. Do not put them in `app.py`, the saved workspace JSON, or a shared report. A new broker login may still be required when the session or TOTP expires.")
+if all([def_api_key, def_client_id, def_pin, def_totp]):
+    try:
+        owner_password_hash = str(st.secrets.get("app_access", {}).get("password_sha256", ""))
+    except Exception:
+        owner_password_hash = ""
+    with st.expander("Connect using saved owner credentials", expanded=False):
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", owner_password_hash):
+            st.info("Saved owner credentials are protected on this public app. Configure app_access.password_sha256 in Streamlit Secrets to unlock them, or use your own manual login above.")
+        else:
+            with st.form("owner_unlock"):
+                owner_password = st.text_input("Owner access password", type="password")
+                if st.form_submit_button("Unlock saved connection"):
+                    cooldown = st.session_state.get("owner_retry_after", 0)
+                    if time.time() < cooldown:
+                        st.warning("Wait before trying another password.")
+                    elif hmac.compare_digest(hashlib.sha256(owner_password.encode()).hexdigest(), owner_password_hash.lower()):
+                        st.session_state["owner_unlocked"] = True
+                        st.success("Saved connection unlocked for this session.")
+                    else:
+                        st.session_state["owner_retry_after"] = time.time() + 5
+                        st.error("Access password did not match.")
+            if st.button("Connect saved owner broker", disabled=not st.session_state.get("owner_unlocked", False), key="connect_owner_broker"):
+                owner_client, owner_message = connect_angel_one(def_api_key, def_client_id, def_pin, def_totp)
+                if owner_client:
+                    st.session_state["smart_api"] = owner_client
+                    st.session_state["live_orders_armed"] = False
+                    st.session_state["live_order_acknowledgement"] = False
+                    st.session_state.pop("broker_account_view", None)
+                    clear_all_short_lived_broker_cache()
+                    st.rerun()
+                else:
+                    st.error("Saved broker login failed. Verify credentials privately in Streamlit Secrets.")
+st.caption("Credentials are never prefilled from server secrets or saved in your journal. Reconnect when the broker session expires.")
+
+if st.session_state.get("smart_api") is not None:
+    if st.button("Disconnect broker and lock this session", key="disconnect_broker"):
+        for private_key in ("smart_api", "owner_unlocked", "broker_account_view", "broker_option_prices", "last_live_submission"):
+            st.session_state.pop(private_key, None)
+        st.session_state["live_orders_armed"] = False
+        st.session_state["live_order_acknowledgement"] = False
+        clear_all_short_lived_broker_cache()
+        st.rerun()
+
+render_broker_status()
+
+def sync_live_arming():
+    st.session_state["live_orders_armed"] = bool(st.session_state.get("live_order_acknowledgement"))
 
 if "smart_api" in st.session_state and LIVE_ORDER_EXECUTION_ENABLED:
     st.markdown("<div class='live-arm-card'><strong>Live-order safety gate</strong><br>Arming enables controls only. Each BUY or SELL still needs its own confirmation, and a broker response means <em>submitted</em>, not filled.</div>", unsafe_allow_html=True)
     armed = st.checkbox(
         "I understand that LIVE mode can submit real orders to Angel One and I want to arm the live controls for this browser session.",
         key="live_order_acknowledgement",
+        on_change=sync_live_arming,
     )
     st.session_state["live_orders_armed"] = armed
     if armed:
