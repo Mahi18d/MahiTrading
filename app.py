@@ -1,4 +1,6 @@
 import csv
+import base64
+import concurrent.futures
 from datetime import datetime, timedelta
 import gzip
 import hashlib
@@ -12,6 +14,9 @@ import threading
 import time
 import importlib.util
 import urllib.request
+from urllib.parse import quote
+import html
+import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
@@ -29,7 +34,7 @@ except ImportError:
     PYOTP_AVAILABLE = False
 
 # SmartAPI's import can contact a public-IP service.  Delay that import until
-# the user actually connects, so simply opening the dashboard is network-free.
+# the user actually connects, so simply opening the app is network-free.
 SMARTAPI_AVAILABLE = importlib.util.find_spec("SmartApi") is not None
 
 
@@ -46,35 +51,233 @@ OPTION_MASTER_URLS = (
 OPTION_SNAPSHOT_TTL_SECONDS = 10
 OPTION_GREEKS_TTL_SECONDS = 60
 OPTION_CHART_TTL_SECONDS = 60
+OPTION_CHAIN_TTL_SECONDS = 10
+UNDERLYING_INDEX_TTL_SECONDS = 10
+OPTION_CHAIN_MAX_TOKENS = 50
 YFINANCE_LOG_LOCK = threading.RLock()
 INDEX_CONSTITUENT_CACHE_LOCK = threading.RLock()
 IST_TIMEZONE = ZoneInfo("Asia/Kolkata")
+
+# The F&O desk deliberately exposes only liquid index products requested for
+# this workspace.  Each entry declares the exact Angel One master identity
+# and exchange instead of guessing from a display label.  In particular,
+# SENSEX options are BFO contracts while the other listed index options are
+# NFO contracts.
+FO_INDEX_UNIVERSE = {
+    "NIFTY 50": {
+        "broker_underlyings": ("NIFTY",),
+        "option_exchange": "NFO",
+        "spot_exchange": "NSE",
+        "chart_symbol": "^NSEI",
+        "description": "NIFTY index options",
+    },
+    "BANKNIFTY": {
+        "broker_underlyings": ("BANKNIFTY",),
+        "option_exchange": "NFO",
+        "spot_exchange": "NSE",
+        "chart_symbol": "^NSEBANK",
+        "description": "NIFTY Bank index options",
+    },
+    "FINNIFTY": {
+        "broker_underlyings": ("FINNIFTY",),
+        "option_exchange": "NFO",
+        "spot_exchange": "NSE",
+        "chart_symbol": "NIFTY_FIN_SERVICE.NS",
+        "description": "NIFTY Financial Services index options",
+    },
+    "SENSEX": {
+        "broker_underlyings": ("SENSEX",),
+        "option_exchange": "BFO",
+        "spot_exchange": "BSE",
+        "chart_symbol": "^BSESN",
+        "description": "BSE SENSEX index options",
+    },
+    "NIFT Midcap": {
+        "broker_underlyings": ("MIDCPNIFTY",),
+        "option_exchange": "NFO",
+        "spot_exchange": "NSE",
+        "chart_symbol": "NIFTY_MID_SELECT.NS",
+        "description": "MIDCPNIFTY / NIFTY MID SELECT index options",
+    },
+}
+
+FO_PUBLIC_CHART_OPTIONS = {
+    "5 minute": ("5d", "5m"),
+    "15 minute": ("5d", "15m"),
+    "1 hour": ("1mo", "60m"),
+    "1 day": ("6mo", "1d"),
+}
 INDEX_CONSTITUENT_CACHE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "index_constituents_cache.json"
 )
+
+# BSE's official SENSEX constituent download identifies companies with BSE
+# scrip codes.  The public chart provider used in this app needs exchange
+# ticker symbols instead, so this is an explicitly reviewed crosswalk rather
+# than a name-derived guess.  If BSE introduces a new code, parsing fails
+# safely and the UI labels the last validated list as stale until the map is
+# reviewed and updated.
+BSE_SENSEX_YAHOO_SYMBOLS = {
+    "532921": "ADANIPORTS.NS", "500820": "ASIANPAINT.NS", "532215": "AXISBANK.NS",
+    "500034": "BAJFINANCE.NS", "532978": "BAJAJFINSV.NS", "500049": "BEL.NS",
+    "532454": "BHARTIARTL.NS", "543320": "ETERNAL.NS", "532281": "HCLTECH.NS",
+    "500180": "HDFCBANK.NS", "500696": "HINDUNILVR.NS", "532174": "ICICIBANK.NS",
+    "500209": "INFY.NS", "539448": "INDIGO.NS", "500875": "ITC.NS",
+    "500247": "KOTAKBANK.NS", "500510": "LT.NS", "500520": "M&M.NS",
+    "532500": "MARUTI.NS", "532555": "NTPC.NS", "532898": "POWERGRID.NS",
+    "500325": "RELIANCE.NS", "500112": "SBIN.NS", "524715": "SUNPHARMA.NS",
+    "532540": "TCS.NS", "500470": "TATASTEEL.NS", "532755": "TECHM.NS",
+    "500114": "TITAN.NS", "500251": "TRENT.NS", "532538": "ULTRACEMCO.NS",
+}
+
+
+def _parse_direct_yahoo_chart_payload(payload):
+    """Turn one Yahoo Chart API JSON response into a usable OHLCV frame."""
+    try:
+        decoded = json.loads(bytes(payload).decode("utf-8"))
+        chart = decoded.get("chart", {}) if isinstance(decoded, dict) else {}
+        result_rows = chart.get("result") if isinstance(chart.get("result"), list) else []
+        result = result_rows[0] if result_rows and isinstance(result_rows[0], dict) else {}
+        timestamps = result.get("timestamp") if isinstance(result.get("timestamp"), list) else []
+        indicators = result.get("indicators") if isinstance(result.get("indicators"), dict) else {}
+        quote_rows = indicators.get("quote") if isinstance(indicators.get("quote"), list) else []
+        quote_row = quote_rows[0] if quote_rows and isinstance(quote_rows[0], dict) else {}
+        if not timestamps or not quote_row:
+            return pd.DataFrame()
+        index = pd.to_datetime(timestamps, unit="s", utc=True).tz_convert(IST_TIMEZONE)
+        frame = pd.DataFrame({
+            "Open": quote_row.get("open", []),
+            "High": quote_row.get("high", []),
+            "Low": quote_row.get("low", []),
+            "Close": quote_row.get("close", []),
+            "Volume": quote_row.get("volume", []),
+        }, index=index)
+        for column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        return frame.dropna(subset=["Open", "High", "Low", "Close"])
+    except (TypeError, ValueError, KeyError, UnicodeDecodeError, json.JSONDecodeError):
+        return pd.DataFrame()
+
+
+def fetch_direct_yahoo_chart_data(symbols, period, interval, urlopen_fn=None):
+    """Read Yahoo's public Chart API when yfinance itself cannot load its cache.
+
+    This is a transport fallback for the same public provider, not a synthetic
+    price feed.  Each response is parsed as OHLCV or discarded entirely.
+    """
+    requested = [symbols] if isinstance(symbols, str) else list(symbols or [])
+    if not requested:
+        return pd.DataFrame(), "No chart symbols were requested."
+    opener = urlopen_fn or urllib.request.urlopen
+
+    def fetch_one(symbol):
+        safe_symbol = quote(str(symbol), safe=".^-_")
+        source_url = (
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{safe_symbol}"
+            f"?range={quote(str(period), safe='')}&interval={quote(str(interval), safe='')}"
+        )
+        try:
+            request = urllib.request.Request(
+                source_url,
+                headers={"User-Agent": "MahiTrading/1.0", "Accept": "application/json"},
+            )
+            with opener(request, timeout=15) as response:
+                status = getattr(response, "status", None)
+                if status is None and hasattr(response, "getcode"):
+                    status = response.getcode()
+                if status is not None and not 200 <= int(status) < 300:
+                    return symbol, pd.DataFrame()
+                frame = _parse_direct_yahoo_chart_payload(response.read())
+            return symbol, frame
+        except (OSError, ValueError, TypeError, TimeoutError):
+            return symbol, pd.DataFrame()
+
+    frames = {}
+    # Bounded concurrency prevents a failed batch from creating dozens of
+    # simultaneous connections while still keeping an all-market scan usable.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(requested))) as executor:
+        for symbol, frame in executor.map(fetch_one, requested):
+            if not frame.empty:
+                frames[symbol] = frame
+    if not frames:
+        return pd.DataFrame(), "Yahoo public chart feed returned no data for this request."
+    if len(requested) == 1:
+        return frames.get(requested[0], pd.DataFrame()), ""
+    return pd.concat(frames, axis=1, sort=False), ""
+
+
+def _fetch_fo_public_index_chart(chart_symbol, period, interval):
+    """Load a labelled public index chart for visual context only.
+
+    This feed is deliberately separate from the Angel One broker evidence used
+    by the F&O gate.  It may be delayed and is never used to choose ATM or to
+    unlock a trade action.
+    """
+    return fetch_direct_yahoo_chart_data(str(chart_symbol), str(period), str(interval))
+
+
+if "--self-test" in sys.argv:
+    fetch_fo_public_index_chart = _fetch_fo_public_index_chart
+else:
+    fetch_fo_public_index_chart = st.cache_data(
+        ttl=UNDERLYING_INDEX_TTL_SECONDS, show_spinner=False
+    )(_fetch_fo_public_index_chart)
+
+
+def _merge_chart_batches(primary, fallback):
+    if primary.empty:
+        return fallback
+    if fallback.empty:
+        return primary
+    if isinstance(primary.columns, pd.MultiIndex) or isinstance(fallback.columns, pd.MultiIndex):
+        return pd.concat([primary, fallback], axis=1)
+    return primary if not primary.empty else fallback
 
 
 def download_public_chart_data(*args, download_fn=None, **kwargs):
     """Load public Yahoo chart data without treating a missing ticker as a price.
 
     yfinance emits a terminal-level "possibly delisted" error for any temporary
-    Yahoo miss.  That text is not a reliable corporate-action signal, so keep
-    the terminal quiet and let the UI show an explicit unavailable state instead.
+    Yahoo miss.  That text is not a reliable corporate-action signal. When its
+    local cache/database fails, use the same provider's direct Chart API as a
+    bounded fallback; otherwise show an explicit unavailable state.
     """
     downloader = download_fn or yf.download
     yf_logger = logging.getLogger("yfinance")
+    requested_symbols = args[0] if args else kwargs.get("tickers")
+    period = kwargs.get("period", "5d")
+    interval = kwargs.get("interval", "1d")
+    yfinance_error = ""
     with YFINANCE_LOG_LOCK:
         previous_disabled = yf_logger.disabled
         try:
             yf_logger.disabled = True
             data = downloader(*args, **kwargs)
         except Exception:
-            return pd.DataFrame(), "Yahoo public chart feed request failed. Try refresh later."
+            data = pd.DataFrame()
+            yfinance_error = "Yahoo public chart feed request failed."
         finally:
             yf_logger.disabled = previous_disabled
-    if not isinstance(data, pd.DataFrame) or data.empty:
-        return pd.DataFrame(), "Yahoo public chart feed returned no data for this request."
-    return data, ""
+    if not isinstance(data, pd.DataFrame):
+        data = pd.DataFrame()
+
+    # Keep injected/mocked calls network-free for tests, and only use a second
+    # network path for the real yfinance transport.
+    if download_fn is not None:
+        if data.empty:
+            return pd.DataFrame(), yfinance_error or "Yahoo public chart feed returned no data for this request."
+        return data, ""
+
+    missing_symbols = missing_public_chart_symbols(data, requested_symbols) if not data.empty else (
+        [requested_symbols] if isinstance(requested_symbols, str) else list(requested_symbols or [])
+    )
+    if missing_symbols:
+        fallback_data, fallback_message = fetch_direct_yahoo_chart_data(missing_symbols, period, interval)
+        if not fallback_data.empty:
+            data = _merge_chart_batches(data, fallback_data)
+    if not data.empty:
+        return data, ""
+    return pd.DataFrame(), yfinance_error or fallback_message or "Yahoo public chart feed returned no data for this request."
 
 
 def missing_public_chart_symbols(data, requested_symbols):
@@ -142,18 +345,77 @@ def parse_official_index_constituent_csv(payload, yahoo_suffix=".NS"):
     return symbols
 
 
+def parse_official_bse_sensex_constituent_csv(payload):
+    """Parse BSE's official SENSEX CSV using only reviewed chart-symbol mappings.
+
+    BSE's file intentionally contains BSE numeric scrip codes, not chart feed
+    tickers.  Never turn a company name into a guessed ticker: every code must
+    exist in ``BSE_SENSEX_YAHOO_SYMBOLS`` and every result must be unique.
+    """
+    if not isinstance(payload, (bytes, bytearray)) or len(payload) < 20:
+        raise ValueError("Official BSE SENSEX constituent file was empty or unreadable.")
+    try:
+        text = bytes(payload).decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Official BSE SENSEX constituent file was not UTF-8 CSV data.") from exc
+    lowered = text.lstrip().lower()
+    if lowered.startswith("<!doctype") or lowered.startswith("<html") or "access denied" in lowered[:500]:
+        raise ValueError("Official BSE SENSEX constituent download returned an HTML/error page.")
+    reader = csv.DictReader(StringIO(text))
+    if not reader.fieldnames:
+        raise ValueError("Official BSE SENSEX constituent file has no CSV header.")
+    normalized_headers = {str(header).strip().casefold(): header for header in reader.fieldnames if header}
+    name_header = normalized_headers.get("constituents")
+    code_header = normalized_headers.get("symbol")
+    if not name_header or not code_header:
+        raise ValueError("Official BSE SENSEX constituent file needs Constituents and Symbol columns.")
+
+    symbols = []
+    seen_codes = set()
+    seen_symbols = set()
+    for row in reader:
+        company_name = str(row.get(name_header) or "").strip()
+        raw_code = str(row.get(code_header) or "").strip()
+        if not company_name or not re.fullmatch(r"\d{6}", raw_code):
+            raise ValueError("Official BSE SENSEX constituent file contains an invalid company or scrip code.")
+        if raw_code in seen_codes:
+            raise ValueError(f"Official BSE SENSEX constituent file has duplicate scrip code: {raw_code}.")
+        chart_symbol = BSE_SENSEX_YAHOO_SYMBOLS.get(raw_code)
+        if not chart_symbol:
+            raise ValueError(
+                f"BSE SENSEX scrip code {raw_code} has no reviewed public-chart mapping; update it before scanning."
+            )
+        if chart_symbol in seen_symbols:
+            raise ValueError(f"BSE SENSEX mapping has a duplicate chart symbol: {chart_symbol}.")
+        seen_codes.add(raw_code)
+        seen_symbols.add(chart_symbol)
+        symbols.append(chart_symbol)
+    if not symbols:
+        raise ValueError("Official BSE SENSEX constituent file contained no symbols.")
+    return symbols
+
+
 def fetch_official_index_constituents(source_config, urlopen_fn=None):
-    """Fetch one official public NSE Indices CSV with bounded retry and validation."""
+    """Fetch one configured official constituent CSV with bounded validation."""
     source_url = str(source_config.get("url") or "")
+    parser_name = str(source_config.get("parser") or "nse").lower()
     checked_at = ist_now().strftime("%Y-%m-%d %H:%M:%S %Z")
     metadata = {
         "source_url": source_url,
-        "publisher": "NSE Indices public constituent CSV",
+        "publisher": str(source_config.get("publisher") or "Official constituent CSV"),
         "checked_at": checked_at,
         "last_modified": "",
         "etag": "",
     }
-    if not source_url.startswith("https://www.niftyindices.com/"):
+    if parser_name == "nse":
+        trusted_source = source_url.startswith("https://www.niftyindices.com/")
+        parser = parse_official_index_constituent_csv
+    elif parser_name == "bse_sensex":
+        trusted_source = source_url == "https://www.bseindices.com/AsiaIndexAPI/api/Codewise_IndicesDownload/w?code=16"
+        parser = parse_official_bse_sensex_constituent_csv
+    else:
+        return [], "Official constituent source parser is not configured safely.", metadata
+    if not trusted_source:
         return [], "Official constituent source URL is not configured safely.", metadata
 
     opener = urlopen_fn or urllib.request.urlopen
@@ -176,7 +438,7 @@ def fetch_official_index_constituents(source_config, urlopen_fn=None):
                     raise OSError(f"HTTP {status}")
                 payload = response.read()
                 headers = getattr(response, "headers", {})
-            symbols = parse_official_index_constituent_csv(payload)
+            symbols = parser(payload)
             minimum = int(source_config.get("minimum", 1))
             maximum = int(source_config.get("maximum", 10_000))
             if not minimum <= len(symbols) <= maximum:
@@ -254,7 +516,7 @@ def resolve_active_index_basket(basket_name, ist_date, force_refresh=False):
         return {
             "symbols": cached_symbols,
             "state": "official",
-            "source": "Official NSE Indices public constituent CSV",
+            "source": str(source_config.get("publisher") or "Official constituent CSV"),
             "source_url": source_config["url"],
             "checked_at": cached.get("fetched_at", checked_at),
             "last_success_at": cached.get("fetched_at", ""),
@@ -291,7 +553,7 @@ def resolve_active_index_basket(basket_name, ist_date, force_refresh=False):
         return {
             "symbols": cached_symbols,
             "state": "stale",
-            "source": "Previously validated NSE Indices constituent cache",
+            "source": f"Previously validated {source_config.get('publisher') or 'official constituent'} cache",
             "source_url": cached.get("source_url", source_config["url"]),
             "checked_at": checked_at,
             "last_success_at": cached.get("fetched_at", ""),
@@ -393,25 +655,28 @@ def _normalise_angel_tick(value):
     return raw / 100.0 if raw >= 1 else raw
 
 
-def extract_option_contracts(master_rows, underlying):
-    """Build option-contract metadata solely from Angel One's master file."""
+def extract_option_contracts(master_rows, underlying, allowed_exchanges=("NFO", "BFO"), instrument_types=("OPTIDX", "OPTSTK")):
+    """Build broker-listed option metadata without inventing exchange or price data."""
     contracts = []
     target = str(underlying or "").strip().upper()
+    allowed_exchange_set = {str(value).upper() for value in allowed_exchanges}
+    allowed_instrument_set = {str(value).upper() for value in instrument_types}
     for item in master_rows or []:
         if not isinstance(item, dict):
             continue
-        if str(item.get("exch_seg", "")).upper() != "NFO":
+        exchange = str(item.get("exch_seg", "")).upper()
+        if exchange not in allowed_exchange_set:
             continue
         instrument_type = str(item.get("instrumenttype", "")).upper()
         symbol = str(item.get("symbol", "")).strip().upper()
         side = _option_side(symbol or item.get("optiontype"))
-        if instrument_type not in {"OPTIDX", "OPTSTK"} or side not in {"CE", "PE"}:
+        if instrument_type not in allowed_instrument_set or side not in {"CE", "PE"}:
             continue
         if str(item.get("name", "")).strip().upper() != target:
             continue
         expiry_raw = str(item.get("expiry", "")).strip().upper()
         expiry_date = _parse_angel_expiry(expiry_raw)
-        if expiry_date is not None and expiry_date < datetime.now().date():
+        if expiry_date is not None and expiry_date < ist_now().date():
             continue
         strike = _normalise_angel_strike(item.get("strike"))
         lot_size = _as_int(item.get("lotsize"))
@@ -421,7 +686,7 @@ def extract_option_contracts(master_rows, underlying):
             "symbol": symbol,
             "token": str(item["token"]),
             "underlying": target,
-            "exchange": "NFO",
+            "exchange": exchange,
             "instrument_type": instrument_type,
             "expiry_raw": expiry_raw,
             "expiry_date": expiry_date,
@@ -442,6 +707,372 @@ def extract_option_contracts(master_rows, underlying):
     )
 
 
+def extract_option_underlyings(master_rows):
+    """List only broker-listed, non-expired NFO option underlyings from the master."""
+    underlyings = set()
+    today = ist_now().date()
+    for item in master_rows or []:
+        if not isinstance(item, dict) or str(item.get("exch_seg", "")).upper() != "NFO":
+            continue
+        if str(item.get("instrumenttype", "")).upper() not in {"OPTIDX", "OPTSTK"}:
+            continue
+        if _option_side(item.get("symbol") or item.get("optiontype")) not in {"CE", "PE"}:
+            continue
+        expiry = _parse_angel_expiry(str(item.get("expiry", "")))
+        name = str(item.get("name", "")).strip().upper()
+        if name and (expiry is None or expiry >= today):
+            underlyings.add(name)
+    return sorted(underlyings)
+
+
+def fo_contract_key(contract):
+    """Return an exchange-aware key so BFO/NFO tokens can never collide."""
+    row = contract if isinstance(contract, dict) else {}
+    return f"{str(row.get('exchange') or '').upper()}:{str(row.get('token') or '')}"
+
+
+def resolve_fo_index_option_contracts(master_rows, index_name):
+    """Return only current OPTIDX contracts for one supported F&O index.
+
+    The display name is never treated as a broker symbol.  A missing index in
+    the official master is surfaced as an empty result, not silently replaced
+    with a stock or another derivative contract.
+    """
+    spec = FO_INDEX_UNIVERSE.get(str(index_name))
+    if not spec:
+        return []
+    contracts = []
+    for broker_underlying in spec["broker_underlyings"]:
+        contracts.extend(extract_option_contracts(
+            master_rows,
+            broker_underlying,
+            allowed_exchanges=(spec["option_exchange"],),
+            instrument_types=("OPTIDX",),
+        ))
+    unique = {}
+    for contract in contracts:
+        key = fo_contract_key(contract)
+        if key and key not in unique:
+            unique[key] = contract
+    return sorted(
+        unique.values(),
+        key=lambda row: (
+            row["expiry_date"] is None,
+            row["expiry_date"] or datetime.max.date(),
+            row["strike"],
+            row["side"],
+        ),
+    )
+
+
+def resolve_fo_index_spot_contract(master_rows, index_name):
+    """Resolve the broker's AMXIDX index record for the selected five-index desk."""
+    spec = FO_INDEX_UNIVERSE.get(str(index_name))
+    if not spec:
+        return None
+    names = {str(value).upper() for value in spec["broker_underlyings"]}
+    candidates = []
+    for item in master_rows or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("exch_seg") or "").upper() != spec["spot_exchange"]:
+            continue
+        if str(item.get("instrumenttype") or "").upper() != "AMXIDX":
+            continue
+        if str(item.get("name") or "").strip().upper() not in names:
+            continue
+        symbol = str(item.get("symbol") or "").strip().upper()
+        token = str(item.get("token") or "").strip()
+        if symbol and token:
+            candidates.append({
+                "exchange": spec["spot_exchange"],
+                "symbol": symbol,
+                "token": token,
+                "underlying": str(item.get("name") or "").strip().upper(),
+                "instrument_type": "AMXIDX",
+            })
+    return sorted(candidates, key=lambda row: (row["symbol"], row["token"]))[0] if candidates else None
+
+
+def pair_fo_index_contracts(contracts):
+    """Pair CE/PE by verified strike without manufacturing a missing leg."""
+    pairs = {}
+    for contract in contracts or []:
+        if not isinstance(contract, dict) or contract.get("side") not in {"CE", "PE"}:
+            continue
+        strike = _as_float(contract.get("strike"))
+        if strike is None:
+            continue
+        pair = pairs.setdefault(float(strike), {"strike": float(strike)})
+        side = contract["side"]
+        # Master duplicates are never merged across exchange/token.  The first
+        # deterministic record is kept and the duplicate remains excluded.
+        pair.setdefault(side, contract)
+    return {strike: pairs[strike] for strike in sorted(pairs)}
+
+
+def nearest_fo_chain_strike(pairs, broker_ltp):
+    """Return an actual listed strike nearest a verified broker index LTP."""
+    price = _as_float(broker_ltp)
+    strikes = sorted(float(value) for value in (pairs or {}).keys())
+    if price is None or price <= 0 or not strikes:
+        return None
+    return min(strikes, key=lambda strike: (abs(strike - price), strike))
+
+
+def fo_chain_band(pairs, center_strike, depth=5):
+    """Return a bounded strike band around a selected, listed centre strike."""
+    strikes = sorted(float(value) for value in (pairs or {}).keys())
+    if not strikes:
+        return []
+    centre = _as_float(center_strike)
+    if centre is None or centre not in pairs:
+        return []
+    width = max(0, _as_int(depth) or 0)
+    centre_index = strikes.index(float(centre))
+    start = max(0, centre_index - width)
+    end = min(len(strikes), centre_index + width + 1)
+    return [pairs[strike] for strike in strikes[start:end]]
+
+
+def _quote_number(row, *keys):
+    for key in keys:
+        if isinstance(row, dict) and row.get(key) not in (None, ""):
+            number = _as_float(row.get(key))
+            if number is not None:
+                return number
+    return None
+
+
+def _quote_best_prices(row):
+    """Extract bid/ask only from explicit broker depth fields when present."""
+    bid = _quote_number(row, "bestBidPrice", "bestbidprice", "bidPrice", "bidprice", "bid")
+    ask = _quote_number(row, "bestAskPrice", "bestaskprice", "askPrice", "askprice", "ask")
+    depth = row.get("best5Data") or row.get("best5data") or row.get("depth") if isinstance(row, dict) else None
+    if not isinstance(depth, (list, tuple, dict)):
+        return bid, ask
+    depth_rows = []
+    if isinstance(depth, dict):
+        for side_name, values in depth.items():
+            if isinstance(values, list):
+                for value in values:
+                    if isinstance(value, dict):
+                        decorated = dict(value)
+                        decorated.setdefault("_depth_side", side_name)
+                        depth_rows.append(decorated)
+    else:
+        depth_rows = [value for value in depth if isinstance(value, dict)]
+    for depth_row in depth_rows:
+        side = str(depth_row.get("_depth_side") or depth_row.get("flag") or depth_row.get("side") or depth_row.get("type") or "").upper()
+        price = _quote_number(depth_row, "price", "Price", "bid", "ask")
+        if price is None:
+            continue
+        if bid is None and side in {"BUY", "BID", "0"}:
+            bid = price
+        if ask is None and side in {"SELL", "ASK", "1"}:
+            ask = price
+    return bid, ask
+
+
+def normalise_broker_market_quote(row, exchange, token):
+    """Keep raw SmartAPI FULL-market fields; unavailable fields stay None."""
+    data = row if isinstance(row, dict) else {}
+    bid, ask = _quote_best_prices(data)
+    return {
+        "exchange": str(exchange or "").upper(),
+        "token": str(token or ""),
+        "ltp": _quote_number(data, "ltp", "lastTradedPrice", "last_traded_price", "lastPrice"),
+        "close": _quote_number(data, "close", "previousClose", "previous_close"),
+        "open": _quote_number(data, "open"),
+        "high": _quote_number(data, "high"),
+        "low": _quote_number(data, "low"),
+        "net_change": _quote_number(data, "netChange", "netchange", "change"),
+        "percent_change": _quote_number(data, "percentChange", "percentchange", "pChange", "pchange"),
+        "bid": bid,
+        "ask": ask,
+        "volume": _quote_number(data, "tradeVolume", "tradevolume", "volume", "totalTradedVolume"),
+        "open_interest": _quote_number(data, "opnInterest", "openInterest", "openinterest", "oi"),
+        "broker_timestamp": data.get("exchangeFeedTime") or data.get("exchangeTimestamp") or data.get("tradeTime"),
+    }
+
+
+def fetch_broker_market_data(smart_api, contracts, mode="FULL"):
+    """Load a bounded batch of real quotes for an exact broker contract list.
+
+    SmartAPI does not provide a ready-made option-chain endpoint.  This calls
+    its supported batch market-data method for the selected band only.  No
+    missing field is calculated, carried over, or filled from another source.
+    """
+    rows = [row for row in contracts or [] if isinstance(row, dict) and row.get("token") and row.get("exchange")]
+    if smart_api is None:
+        return {"ok": False, "state": "disconnected", "message": "Angel One is not connected.", "quotes": {}, "requested_count": len(rows), "fetched_count": 0}
+    if not hasattr(smart_api, "getMarketData"):
+        return {"ok": False, "state": "unavailable", "message": "Installed SmartAPI client has no batch market-data method.", "quotes": {}, "requested_count": len(rows), "fetched_count": 0}
+    if not rows:
+        return {"ok": False, "state": "invalid_contract", "message": "No verified F&O contracts were selected for the chain.", "quotes": {}, "requested_count": 0, "fetched_count": 0}
+    if len(rows) > OPTION_CHAIN_MAX_TOKENS:
+        return {"ok": False, "state": "too_many_contracts", "message": f"The requested chain has {len(rows)} contracts; SmartAPI batch requests are capped at {OPTION_CHAIN_MAX_TOKENS} here.", "quotes": {}, "requested_count": len(rows), "fetched_count": 0}
+
+    exchange_tokens = {}
+    requested = {}
+    for contract in rows:
+        exchange = str(contract["exchange"]).upper()
+        token = str(contract["token"])
+        exchange_tokens.setdefault(exchange, []).append(token)
+        requested[f"{exchange}:{token}"] = contract
+    try:
+        response = smart_api.getMarketData(str(mode).upper(), exchange_tokens)
+    except Exception as exc:
+        return {"ok": False, "state": "error", "message": f"Broker option-chain request failed: {exc}", "quotes": {}, "requested_count": len(rows), "fetched_count": 0}
+    if not isinstance(response, dict) or response.get("status") is False:
+        message = response.get("message", "Broker did not return the option-chain snapshot.") if isinstance(response, dict) else "Invalid broker response."
+        return {"ok": False, "state": "unavailable", "message": message, "quotes": {}, "requested_count": len(rows), "fetched_count": 0}
+
+    payload = response.get("data")
+    if isinstance(payload, dict):
+        fetched_rows = payload.get("fetched") or payload.get("data") or []
+    elif isinstance(payload, list):
+        fetched_rows = payload
+    else:
+        fetched_rows = []
+    quotes = {}
+    for raw in fetched_rows:
+        if not isinstance(raw, dict):
+            continue
+        token = str(raw.get("symbolToken") or raw.get("symboltoken") or raw.get("token") or "")
+        exchange = str(raw.get("exchange") or raw.get("exchangeSegment") or raw.get("exch_seg") or "").upper()
+        if not exchange:
+            matches = [key for key in requested if key.endswith(f":{token}")]
+            exchange = matches[0].split(":", 1)[0] if len(matches) == 1 else ""
+        key = f"{exchange}:{token}"
+        if key not in requested:
+            continue
+        quotes[key] = normalise_broker_market_quote(raw, exchange, token)
+    fetched_count = len(quotes)
+    if not fetched_count:
+        return {"ok": False, "state": "unavailable", "message": "Broker returned no matching quotes for the selected chain.", "quotes": {}, "requested_count": len(rows), "fetched_count": 0}
+    state = "snapshot" if fetched_count == len(rows) else "partial"
+    return {
+        "ok": True,
+        "state": state,
+        "message": "" if state == "snapshot" else f"Broker returned {fetched_count} of {len(rows)} requested chain quotes.",
+        "quotes": quotes,
+        "requested_count": len(rows),
+        "fetched_count": fetched_count,
+        "fetched_at": time.time(),
+        "source": "Angel One SmartAPI FULL market data",
+    }
+
+
+def quote_for_fo_contract(chain_snapshot, contract):
+    """Read a chain quote only when it belongs to the exact selected contract."""
+    snapshot = chain_snapshot if isinstance(chain_snapshot, dict) else {}
+    return (snapshot.get("quotes") or {}).get(fo_contract_key(contract), {})
+
+
+def build_fo_chain_rows(chain_pairs, chain_snapshot, selected_contract=None):
+    """Build a side-by-side CE/PE chain table from broker fields only."""
+    rows = []
+    selected_key = fo_contract_key(selected_contract)
+    for pair in chain_pairs or []:
+        ce = pair.get("CE") or {}
+        pe = pair.get("PE") or {}
+        ce_quote = quote_for_fo_contract(chain_snapshot, ce)
+        pe_quote = quote_for_fo_contract(chain_snapshot, pe)
+        row = {"CE Contract": ce.get("symbol") or "—"}
+        for label, key in (("CE LTP", "ltp"), ("CE Chg%", "percent_change"), ("CE Bid", "bid"), ("CE Ask", "ask"), ("CE Volume", "volume"), ("CE OI", "open_interest")):
+            row[label] = ce_quote.get(key)
+        row["Strike"] = pair.get("strike")
+        for label, key in (("PE OI", "open_interest"), ("PE Volume", "volume"), ("PE Bid", "bid"), ("PE Ask", "ask"), ("PE Chg%", "percent_change"), ("PE LTP", "ltp")):
+            row[label] = pe_quote.get(key)
+        row["PE Contract"] = pe.get("symbol") or "—"
+        selected_side = "CE" if fo_contract_key(ce) == selected_key else "PE" if fo_contract_key(pe) == selected_key else ""
+        row["Selected"] = f"← {selected_side}" if selected_side else ""
+        rows.append(row)
+    return rows
+
+
+def build_fo_composite_gate(underlying_snapshot, underlying_evidence, selected_contract, option_gate, option_evidence):
+    """Require aligned broker-confirmed index and selected-premium evidence.
+
+    A bearish index is *not* a PE-buy signal.  A PE still needs its own
+    bullish premium evidence, just as a CE does in a bullish index regime.
+    """
+    underlying = underlying_snapshot if isinstance(underlying_snapshot, dict) else {}
+    underlying_summary = (underlying_evidence or {}).get("summary") if isinstance(underlying_evidence, dict) else {}
+    option_summary = (option_evidence or {}).get("summary") if isinstance(option_evidence, dict) else {}
+    base_gate = option_gate if isinstance(option_gate, dict) else build_fo_trade_gate({}, {}, {})
+    underlying_regime = str((underlying_summary or {}).get("regime") or "INSUFFICIENT_DATA")
+    option_regime = str((option_summary or {}).get("regime") or "INSUFFICIENT_DATA")
+    side = str((selected_contract or {}).get("side") or "")
+    underlying_usable = max(0, _as_int((underlying_summary or {}).get("usable_check_count")) or 0)
+    option_usable = max(0, _as_int((option_summary or {}).get("usable_check_count")) or 0)
+
+    result = dict(base_gate)
+    result["underlying_regime"] = underlying_regime
+    result["option_regime"] = option_regime
+    result["underlying_conditions"] = f"{underlying_usable}/10 usable"
+    result["option_conditions"] = f"{option_usable}/10 usable"
+    result["allow_long_entry"] = False
+
+    if not underlying.get("ok") or underlying_regime == "INSUFFICIENT_DATA":
+        result.update({
+            "decision": "WAIT / UNDERLYING DATA",
+            "decision_note": "NOT A BUY",
+            "conditions": f"Index {underlying_usable}/10 · option {option_usable}/10",
+            "condition_detail": "Broker index quote and current-session broker candles are required",
+            "risk_status": "PLAN ONLY" if base_gate.get("allow_risk_preview") else "LOCKED",
+            "message": "The index context is not broker-verified yet. A public chart may be shown for context, but it never unlocks an F&O entry.",
+            "tone": "fo-gate-wait",
+        })
+        return result
+    if underlying_regime == "SIDEWAYS / NO TRADE":
+        result.update({
+            "decision": "NEUTRAL / NO TRADE",
+            "decision_note": "NO DIRECTIONAL BUY",
+            "conditions": f"Index {underlying_usable}/10 · option {option_usable}/10",
+            "condition_detail": "Broker index is mixed/sideways",
+            "risk_status": "PLAN ONLY" if base_gate.get("allow_risk_preview") else "LOCKED",
+            "message": "The broker-confirmed index is sideways or mixed. Neither CE nor PE is automatically preferred; wait for a clearer regime.",
+            "tone": "fo-gate-wait",
+        })
+        return result
+    if not base_gate.get("allow_long_entry") or option_regime != "BULLISH":
+        result.update({
+            "decision": base_gate.get("decision", "WAIT / NEUTRAL"),
+            "decision_note": "OPTION BUY LOCKED",
+            "conditions": f"Index {underlying_usable}/10 · option {option_usable}/10",
+            "condition_detail": "Selected CE/PE premium has not passed its own bullish check",
+            "risk_status": base_gate.get("risk_status", "PLAN ONLY"),
+            "message": "The selected option premium must independently pass the broker-candle gate. Underlying direction alone is never an option BUY recommendation.",
+            "tone": base_gate.get("tone", "fo-gate-wait"),
+        })
+        return result
+    aligned = (underlying_regime == "BULLISH" and side == "CE") or (underlying_regime == "BEARISH" and side == "PE")
+    if not aligned:
+        result.update({
+            "decision": "DIRECTION MISMATCH / NO TRADE",
+            "decision_note": "NOT A BUY",
+            "conditions": f"Index {underlying_usable}/10 · option {option_usable}/10",
+            "condition_detail": f"Index {underlying_regime}; selected {side or 'unknown'} contract",
+            "risk_status": "PLAN ONLY",
+            "message": "The index and selected option side are not aligned. This is a planning-only state, not a prompt to switch sides automatically.",
+            "tone": "fo-gate-wait",
+        })
+        return result
+    result.update({
+        "decision": f"CONDITIONAL {side} LONG REVIEW",
+        "decision_note": "NOT AN AUTOMATIC BUY",
+        "conditions": f"Index {underlying_usable}/10 · option {option_usable}/10",
+        "condition_detail": f"Broker index {underlying_regime} + selected {side} premium BULLISH",
+        "risk_status": "RISK PLAN READY",
+        "message": "Index direction and the selected option premium are aligned on broker data. Review quote freshness, risk, quantity, and your own plan before any manual confirmation.",
+        "tone": "fo-gate-bull",
+        "allow_long_entry": True,
+    })
+    return result
+
+
 def calculate_directional_preview(action, entry_price, stop_points, target_points, quantity):
     """Calculate direction-aware levels and illustrative P&L without trading."""
     side = str(action).upper()
@@ -459,6 +1090,8 @@ def calculate_directional_preview(action, entry_price, stop_points, target_point
         stop_price, target_price = entry - stop, entry + target
     else:
         stop_price, target_price = entry + stop, entry - target
+    if stop_price <= 0 or target_price <= 0:
+        raise ValueError("Stop-loss or target would create an invalid zero/negative price.")
     return {
         "action": side,
         "entry_price": round(entry, 2),
@@ -468,6 +1101,710 @@ def calculate_directional_preview(action, entry_price, stop_points, target_point
         "target_pnl": round(target * qty, 2),
         "gross_notional": round(entry * qty, 2),
         "quantity": qty,
+    }
+
+
+EVIDENCE_STATES = {"BULLISH", "BEARISH", "NEUTRAL", "UNAVAILABLE"}
+
+
+def directional_state(bullish, bearish):
+    """Return one non-overlapping technical-evidence state."""
+    if bullish and bearish:
+        raise ValueError("A technical check cannot be bullish and bearish at the same time.")
+    if bullish:
+        return "BULLISH"
+    if bearish:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def summarize_directional_evidence(checks, min_usable=6, threshold=6, minimum_lead=2):
+    """Score independent bull/bear/neutral checks without forced complements."""
+    states = []
+    for check in checks or []:
+        if len(check) < 2:
+            raise ValueError("Each technical check needs a label and state.")
+        state = str(check[1]).upper()
+        if state not in EVIDENCE_STATES:
+            raise ValueError(f"Unsupported technical-evidence state: {state}")
+        states.append(state)
+    bullish = states.count("BULLISH")
+    bearish = states.count("BEARISH")
+    neutral = states.count("NEUTRAL")
+    unavailable = states.count("UNAVAILABLE")
+    usable = bullish + bearish + neutral
+    if usable < min_usable:
+        regime = "INSUFFICIENT_DATA"
+    elif bullish >= threshold and bullish >= bearish + minimum_lead:
+        regime = "BULLISH"
+    elif bearish >= threshold and bearish >= bullish + minimum_lead:
+        regime = "BEARISH"
+    else:
+        regime = "SIDEWAYS / NO TRADE"
+    return {
+        "buy_score": bullish,
+        "sell_score": bearish,
+        "neutral_count": neutral,
+        "unavailable_count": unavailable,
+        "usable_check_count": usable,
+        "total_check_count": len(states),
+        "regime": regime,
+    }
+
+
+def evidence_items_html(checks):
+    """Render a compact, safely escaped list of independent technical evidence."""
+    state_style = {
+        "BULLISH": ("✅", "tag-bull"),
+        "BEARISH": ("🔻", "tag-bear"),
+        "NEUTRAL": ("➖", "tag-neutral"),
+        "UNAVAILABLE": ("•", "tag-muted"),
+    }
+    parts = []
+    for rule, state, detail in checks:
+        label, css_class = state_style.get(str(state).upper(), ("•", "tag-muted"))
+        parts.append(
+            '<div class="check-item"><span>{} {}</span><span class="{}">{}</span></div>'.format(
+                label, html.escape(str(rule)), css_class, html.escape(str(detail))
+            )
+        )
+    return "".join(parts)
+
+
+def trade_policy_for_horizon(horizon):
+    """Return the conservative new-position policy for the selected equity horizon."""
+    if str(horizon) == "Long Term (Weekly)":
+        return {
+            "long_term": True,
+            "allowed_actions": {"BUY"},
+            "allowed_order_kinds": {"NORMAL"},
+            "required_product": "DELIVERY",
+            "message": "Long Term is long-only for new positions. Exit-selling verified holdings is not implemented here.",
+        }
+    return {
+        "long_term": False,
+        "allowed_actions": {"BUY", "SELL"},
+        "allowed_order_kinds": {"NORMAL", "ROBO"},
+        "required_product": None,
+        "message": "",
+    }
+
+
+EQUITY_SCAN_COLUMNS = [
+    "Symbol", "Price", "Chg%", "Session Δ%", "Trend", "VWAP", "RSI",
+    "Buy", "Sell", "Setup", "Data status",
+]
+
+
+def _market_frame_for_symbol(batch_data, symbol):
+    """Return one usable OHLCV frame from a public-chart batch, or an empty frame."""
+    if not isinstance(batch_data, pd.DataFrame) or batch_data.empty:
+        return pd.DataFrame()
+    try:
+        frame = batch_data[symbol] if isinstance(batch_data.columns, pd.MultiIndex) else batch_data
+    except (KeyError, TypeError, AttributeError):
+        return pd.DataFrame()
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    if not isinstance(frame, pd.DataFrame) or any(column not in frame.columns for column in required):
+        return pd.DataFrame()
+    return frame.dropna(subset=["Open", "High", "Low", "Close"])
+
+
+def _unavailable_equity_scan_row(symbol, detail="Public chart feed returned no usable OHLC data."):
+    """Keep a requested member visible without inventing an unavailable price."""
+    clean_symbol = str(symbol).removesuffix(".NS").removesuffix(".BO")
+    return {
+        "Symbol": clean_symbol,
+        "Price": np.nan,
+        "Chg%": np.nan,
+        "Session Δ%": np.nan,
+        "Trend": "DATA UNAVAILABLE",
+        "VWAP": np.nan,
+        "RSI": np.nan,
+        "Buy": "— / 10",
+        "Sell": "— / 10",
+        "Setup": "UNAVAILABLE",
+        "Data status": detail,
+    }
+
+
+def market_scan_action(trend, horizon):
+    """Use review/no-trade labels; a technical score is never an order instruction."""
+    normalized_trend = str(trend or "").upper()
+    if normalized_trend == "BULLISH":
+        return "BUY REVIEW"
+    if normalized_trend == "BEARISH":
+        return "BEARISH / NO NEW BUY" if trade_policy_for_horizon(horizon)["long_term"] else "SELL REVIEW"
+    if normalized_trend == "DATA UNAVAILABLE" or normalized_trend == "INSUFFICIENT_DATA":
+        return "WAIT / DATA"
+    return "NEUTRAL / NO TRADE"
+
+
+def evaluate_equity_intelligence_scan(symbols, intraday_data, daily_data, extrema_order):
+    """Evaluate one batch with the same ten independent equity checks used by the UI.
+
+    The result keeps every requested constituent.  A missing public response is
+    a visible unavailable row, never a zero price or a stale substitute.
+    """
+    rows = []
+    checklists = {}
+    current_prices = {}
+    for symbol in list(symbols or []):
+        clean_symbol = str(symbol).removesuffix(".NS").removesuffix(".BO")
+        try:
+            frame = _market_frame_for_symbol(intraday_data, symbol)
+            if len(frame) < 25:
+                rows.append(_unavailable_equity_scan_row(symbol, "Public chart feed has fewer than 25 usable bars."))
+                continue
+
+            close = pd.to_numeric(frame["Close"], errors="coerce")
+            high = pd.to_numeric(frame["High"], errors="coerce")
+            low = pd.to_numeric(frame["Low"], errors="coerce")
+            volume = pd.to_numeric(frame["Volume"], errors="coerce")
+            open_series = pd.to_numeric(frame["Open"], errors="coerce")
+            if close.isna().any() or high.isna().any() or low.isna().any() or open_series.isna().any():
+                rows.append(_unavailable_equity_scan_row(symbol))
+                continue
+
+            ema20 = close.ewm(span=20, adjust=False).mean()
+            ema50 = close.ewm(span=50, adjust=False).mean()
+            delta = close.diff()
+            gain = delta.where(delta > 0, 0).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            rs = gain / loss.replace(0, np.nan)
+            rsi = 100 - (100 / (1 + rs))
+
+            true_range = pd.concat([
+                high - low,
+                (high - close.shift(1)).abs(),
+                (low - close.shift(1)).abs(),
+            ], axis=1).max(axis=1)
+            atr_candidate = _as_float(true_range.rolling(14).mean().iloc[-1])
+            ltp = float(close.iloc[-1])
+            atr_value = atr_candidate if atr_candidate is not None and atr_candidate > 0 else max(ltp * 0.015, 0.01)
+
+            typical_price = (high + low + close) / 3.0
+            cumulative_volume = volume.fillna(0).cumsum()
+            vwap_series = (typical_price * volume.fillna(0)).cumsum() / cumulative_volume.replace(0, np.nan)
+            vwap_value = _as_float(vwap_series.iloc[-1])
+            volume_available = bool(volume.fillna(0).gt(0).any())
+
+            session_frame = frame
+            try:
+                session_index = pd.to_datetime(frame.index, errors="coerce")
+                latest_session = session_index[-1].date()
+                same_session = session_index.date == latest_session
+                if same_session.sum() >= 1:
+                    session_frame = frame.loc[same_session]
+            except (AttributeError, IndexError, TypeError, ValueError):
+                pass
+            opening_bars = min(3, len(session_frame))
+            orb_high = float(pd.to_numeric(session_frame["High"], errors="coerce").iloc[:opening_bars].max())
+            orb_low = float(pd.to_numeric(session_frame["Low"], errors="coerce").iloc[:opening_bars].min())
+            session_open = float(pd.to_numeric(session_frame["Open"], errors="coerce").iloc[0])
+
+            previous = float(close.iloc[-2])
+            last_bar_change = ((ltp - previous) / previous * 100.0) if previous > 0 else np.nan
+            session_change = ((ltp - session_open) / session_open * 100.0) if session_open > 0 else np.nan
+            rsi_value = _as_float(rsi.iloc[-1])
+            ema20_value = float(ema20.iloc[-1])
+            ema50_value = float(ema50.iloc[-1])
+            current_volume = _as_float(volume.iloc[-1])
+            average_volume = _as_float(volume.iloc[-20:].mean()) if len(volume) >= 20 else current_volume
+            support = float(low.iloc[-int(extrema_order):].min())
+            resistance = float(high.iloc[-int(extrema_order):].max())
+
+            macro_ema = ema50_value
+            macro_detail = f"Intraday 50 EMA fallback: ₹{ema50_value:.2f}"
+            daily_frame = _market_frame_for_symbol(daily_data, symbol)
+            if len(daily_frame) >= 50:
+                daily_close = pd.to_numeric(daily_frame["Close"], errors="coerce").dropna()
+                if len(daily_close) >= 50:
+                    macro_ema = float(daily_close.ewm(span=50, adjust=False).mean().iloc[-1])
+                    macro_detail = f"Daily 50 EMA: ₹{macro_ema:.2f}"
+
+            price_buffer = max(atr_value * 0.10, ltp * 0.001)
+            history = frame.iloc[-min(20, len(frame) - 1) - 1:-1]
+            prior_resistance = float(pd.to_numeric(history["High"], errors="coerce").max())
+            prior_support = float(pd.to_numeric(history["Low"], errors="coerce").min())
+            macro_state = directional_state(ltp > macro_ema + price_buffer, ltp < macro_ema - price_buffer)
+            rsi_state = "UNAVAILABLE" if rsi_value is None else directional_state(
+                55.0 <= rsi_value <= 70.0, 30.0 <= rsi_value <= 45.0
+            )
+            checks = [
+                ("1. MTF Macro Filter", macro_state, macro_detail),
+                ("2. VWAP Baseline", "UNAVAILABLE" if vwap_value is None else directional_state(ltp > vwap_value + price_buffer, ltp < vwap_value - price_buffer), "VWAP unavailable" if vwap_value is None else f"VWAP: ₹{vwap_value:.2f}"),
+                ("3. Opening-Range Break", directional_state(ltp > orb_high + price_buffer, ltp < orb_low - price_buffer), f"ORB: ₹{orb_low:.2f}–₹{orb_high:.2f}"),
+                ("4. Price vs 20 EMA", directional_state(ltp > ema20_value + price_buffer, ltp < ema20_value - price_buffer), f"20 EMA: ₹{ema20_value:.2f}"),
+                ("5. EMA Alignment", directional_state(ema20_value > ema50_value + price_buffer, ema20_value < ema50_value - price_buffer), f"20 / 50 EMA: ₹{ema20_value:.2f} / ₹{ema50_value:.2f}"),
+                ("6. RSI Momentum Corridor", rsi_state, "RSI unavailable" if rsi_value is None else f"RSI @ {rsi_value:.1f}; middle range is neutral"),
+                ("7. Volume Expansion", "UNAVAILABLE" if not volume_available or not average_volume or current_volume is None else directional_state(current_volume >= average_volume * 1.25 and ltp > previous, current_volume >= average_volume * 1.25 and ltp < previous), "Volume unavailable" if not volume_available or not average_volume or current_volume is None else f"{current_volume:,.0f} vs {average_volume:,.0f}"),
+                ("8. Session Momentum", directional_state(ltp > session_open + price_buffer, ltp < session_open - price_buffer), f"Session open: ₹{session_open:.2f} ({session_change:+.2f}%)"),
+                ("9. Prior-Range Break", directional_state(ltp > prior_resistance + price_buffer, ltp < prior_support - price_buffer), f"Prior range: ₹{prior_support:.2f}–₹{prior_resistance:.2f}"),
+                ("10. Short Momentum", directional_state(ltp > float(close.iloc[-4]) + price_buffer, ltp < float(close.iloc[-4]) - price_buffer), f"3-bar change: ₹{ltp - float(close.iloc[-4]):+.2f}"),
+            ]
+            evidence_summary = summarize_directional_evidence(checks, min_usable=7, threshold=6, minimum_lead=2)
+            buy_score = evidence_summary["buy_score"]
+            sell_score = evidence_summary["sell_score"]
+            if rsi_value is not None and (rsi_value >= 74 or rsi_value <= 26):
+                setup = "REVERSAL_WATCH"
+            elif evidence_summary["regime"] == "BULLISH":
+                setup = "BUY_SETUP"
+            elif evidence_summary["regime"] == "BEARISH":
+                setup = "BEARISH_SETUP"
+            else:
+                setup = "CONSOLIDATION"
+
+            checklist_key = clean_symbol if clean_symbol not in checklists else str(symbol)
+            current_prices[clean_symbol] = ltp
+            checklists[checklist_key] = {
+                "sym": symbol,
+                "ltp": ltp,
+                "chg": last_bar_change,
+                "session_chg": session_change,
+                "rsi": rsi_value,
+                "vwap": vwap_value,
+                "orb_high": orb_high,
+                "orb_low": orb_low,
+                "atr": atr_value,
+                "support": support,
+                "resistance": resistance,
+                "checks": checks,
+                "buy_score": buy_score,
+                "sell_score": sell_score,
+                "evidence_summary": evidence_summary,
+                "setup": setup,
+            }
+            rows.append({
+                "Symbol": clean_symbol,
+                "Price": round(ltp, 2),
+                "Chg%": round(last_bar_change, 2),
+                "Session Δ%": round(session_change, 2),
+                "Trend": evidence_summary["regime"],
+                "VWAP": round(vwap_value, 2) if vwap_value is not None else np.nan,
+                "RSI": round(rsi_value, 1) if rsi_value is not None else np.nan,
+                "Buy": f"{buy_score}/10",
+                "Sell": f"{sell_score}/10",
+                "Setup": setup,
+                "Data status": "PUBLIC CHART FEED · MAY BE DELAYED",
+            })
+        except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+            rows.append(_unavailable_equity_scan_row(symbol))
+    return pd.DataFrame(rows, columns=EQUITY_SCAN_COLUMNS), checklists, current_prices
+
+
+def _fetch_equity_and_daily_data(symbols, period, interval):
+    """Fetch the delayed public intraday and daily chart batches once per cache key."""
+    requested = list(symbols or [])
+    if not requested:
+        return requested, pd.DataFrame(), pd.DataFrame(), "No verified constituent list is available.", ""
+    intraday_data, intraday_message = download_public_chart_data(
+        requested, period=period, interval=interval, group_by="ticker", progress=False, threads=True,
+    )
+    daily_data, daily_message = download_public_chart_data(
+        requested, period="1y", interval="1d", group_by="ticker", progress=False, threads=True,
+    )
+    return requested, intraday_data, daily_data, intraday_message, daily_message
+
+
+# Do not create a bare-runtime Streamlit cache while executing the standalone
+# network-free self-test.  The app uses the cached version in normal operation.
+if "--self-test" in sys.argv:
+    fetch_equity_and_daily_data = _fetch_equity_and_daily_data
+else:
+    fetch_equity_and_daily_data = st.cache_data(ttl=180, show_spinner=False)(_fetch_equity_and_daily_data)
+
+
+def validate_equity_trade_policy(horizon, action, order_kind, product_type):
+    """Prevent a UI state from bypassing the long-term new-position policy."""
+    policy = trade_policy_for_horizon(horizon)
+    side = str(action).upper()
+    kind = str(order_kind).upper()
+    product = str(product_type).upper()
+    if side not in policy["allowed_actions"]:
+        return False, "Long Term mode does not open new SELL/short positions."
+    if kind not in policy["allowed_order_kinds"]:
+        return False, "Long Term mode uses delivery market orders only; ROBO is unavailable."
+    if policy["required_product"] and product != policy["required_product"]:
+        return False, "Long Term mode requires the DELIVERY product."
+    return True, ""
+
+
+def normalise_broker_option_candles(candles, session_date=None):
+    """Keep only real, current IST-session broker candles; never fill missing data."""
+    required = ["time", "Open", "High", "Low", "Close", "Volume"]
+    frame = pd.DataFrame(candles or [], columns=required)
+    if frame.empty:
+        return frame
+    frame["time"] = pd.to_datetime(frame["time"], errors="coerce")
+    if getattr(frame["time"].dt, "tz", None) is None:
+        frame["time"] = frame["time"].dt.tz_localize(IST_TIMEZONE, ambiguous="NaT", nonexistent="NaT")
+    else:
+        frame["time"] = frame["time"].dt.tz_convert(IST_TIMEZONE)
+    for column in required[1:]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=["time", "Open", "High", "Low", "Close"]).sort_values("time")
+    session_day = session_date or ist_now().date()
+    minutes = frame["time"].dt.hour * 60 + frame["time"].dt.minute
+    return frame.loc[
+        (frame["time"].dt.date == session_day) & minutes.between(9 * 60 + 15, 15 * 60 + 30)
+    ].copy()
+
+
+def evaluate_intraday_option_evidence(candle_frame, instrument_label="Premium"):
+    """Calculate intraday-only evidence from an authenticated broker candle set."""
+    label = str(instrument_label or "Premium").strip() or "Premium"
+    if not isinstance(candle_frame, pd.DataFrame) or len(candle_frame) < 21:
+        return {
+            "checks": [],
+            "summary": {
+                "buy_score": 0, "sell_score": 0, "neutral_count": 0,
+                "unavailable_count": 0, "usable_check_count": 0,
+                "total_check_count": 10, "regime": "INSUFFICIENT_DATA",
+            },
+            "message": f"At least 21 current-session broker candles are required for the 10-point intraday {label.lower()} scan.",
+        }
+    frame = candle_frame.sort_values("time").copy()
+    close, high, low, open_, volume = (frame[name] for name in ("Close", "High", "Low", "Open", "Volume"))
+    ema9 = close.ewm(span=9, adjust=False).mean()
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    previous_close = float(close.iloc[-2])
+    ltp = float(close.iloc[-1])
+    true_range = pd.concat([
+        high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    atr = float(true_range.rolling(14).mean().iloc[-1]) if pd.notna(true_range.rolling(14).mean().iloc[-1]) else 0.0
+    buffer = max(atr * 0.10, ltp * 0.001)
+    typical = (high + low + close) / 3.0
+    cumulative_volume = volume.fillna(0).cumsum()
+    vwap = (typical * volume.fillna(0)).cumsum() / cumulative_volume.replace(0, np.nan)
+    vwap_value = float(vwap.iloc[-1]) if pd.notna(vwap.iloc[-1]) else None
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    if pd.isna(gain.iloc[-1]) or pd.isna(loss.iloc[-1]):
+        rsi_value = None
+    elif loss.iloc[-1] == 0 and gain.iloc[-1] > 0:
+        rsi_value = 100.0
+    elif gain.iloc[-1] == 0 and loss.iloc[-1] > 0:
+        rsi_value = 0.0
+    elif gain.iloc[-1] == 0 and loss.iloc[-1] == 0:
+        rsi_value = 50.0
+    else:
+        rsi_value = float(100 - (100 / (1 + gain.iloc[-1] / loss.iloc[-1])))
+    orb_bars = min(3, len(frame) - 1)
+    orb_high = float(high.iloc[:orb_bars].max())
+    orb_low = float(low.iloc[:orb_bars].min())
+    history = frame.iloc[-min(20, len(frame) - 1) - 1:-1]
+    prior_resistance = float(history["High"].max())
+    prior_support = float(history["Low"].min())
+    volume_available = bool(volume.fillna(0).gt(0).any())
+    average_volume = float(volume.iloc[-21:-1].mean()) if volume_available else None
+    latest_volume = float(volume.iloc[-1]) if volume_available and pd.notna(volume.iloc[-1]) else None
+    fast_ema_reference = float(ema9.iloc[-4])
+    short_premium_reference = float(close.iloc[-4])
+    bar_change_pct = ((ltp - previous_close) / previous_close * 100.0) if previous_close > 0 else None
+    checks = [
+        ("1. Session VWAP Baseline", "UNAVAILABLE" if vwap_value is None else directional_state(ltp > vwap_value + buffer, ltp < vwap_value - buffer), "VWAP unavailable" if vwap_value is None else f"{label} ₹{ltp:.2f} vs VWAP ₹{vwap_value:.2f}"),
+        ("2. Fast/Slow EMA Alignment", directional_state(float(ema9.iloc[-1]) > float(ema20.iloc[-1]) + buffer, float(ema9.iloc[-1]) < float(ema20.iloc[-1]) - buffer), f"EMA 9 ₹{ema9.iloc[-1]:.2f} · EMA 20 ₹{ema20.iloc[-1]:.2f}"),
+        ("3. Premium vs EMA 20", directional_state(ltp > float(ema20.iloc[-1]) + buffer, ltp < float(ema20.iloc[-1]) - buffer), f"EMA 20 ₹{ema20.iloc[-1]:.2f}"),
+        ("4. Fast EMA Slope", directional_state(float(ema9.iloc[-1]) > fast_ema_reference + buffer, float(ema9.iloc[-1]) < fast_ema_reference - buffer), f"EMA 9 ₹{fast_ema_reference:.2f} → ₹{ema9.iloc[-1]:.2f}"),
+        ("5. Opening-Range Break", directional_state(ltp > orb_high + buffer, ltp < orb_low - buffer), f"First {orb_bars} bars ₹{orb_low:.2f}–₹{orb_high:.2f}"),
+        ("6. RSI Momentum Corridor", "UNAVAILABLE" if rsi_value is None else directional_state(55.0 <= rsi_value <= 70.0, 30.0 <= rsi_value <= 45.0), "RSI unavailable" if rsi_value is None else f"RSI {rsi_value:.1f}; middle range is neutral"),
+        ("7. Volume Expansion", "UNAVAILABLE" if latest_volume is None or not average_volume else directional_state(latest_volume >= average_volume * 1.25 and ltp > previous_close, latest_volume >= average_volume * 1.25 and ltp < previous_close), "Broker volume unavailable" if latest_volume is None or not average_volume else f"{latest_volume:,.0f} vs {average_volume:,.0f}"),
+        ("8. Session Momentum", directional_state(ltp > float(open_.iloc[0]) + buffer, ltp < float(open_.iloc[0]) - buffer), f"Session open ₹{open_.iloc[0]:.2f}"),
+        ("9. Prior-Range Break", directional_state(ltp > prior_resistance + buffer, ltp < prior_support - buffer), f"Prior range ₹{prior_support:.2f}–₹{prior_resistance:.2f}"),
+        (f"10. Short {label} Momentum", directional_state(ltp > short_premium_reference + buffer, ltp < short_premium_reference - buffer), f"3-bar {label.lower()} change ₹{ltp - short_premium_reference:+.2f}"),
+    ]
+    return {
+        "checks": checks,
+        "summary": summarize_directional_evidence(checks, min_usable=7, threshold=6, minimum_lead=2),
+        "message": "",
+        "metrics": {
+            "ltp": ltp, "vwap": vwap_value, "ema9": float(ema9.iloc[-1]), "ema20": float(ema20.iloc[-1]),
+            "rsi": rsi_value, "orb_high": orb_high, "orb_low": orb_low,
+            "support": prior_support, "resistance": prior_resistance,
+            "bar_change_pct": bar_change_pct, "candle_count": len(frame),
+            "latest_volume": latest_volume, "average_volume": average_volume,
+        },
+    }
+
+
+def build_fo_trade_gate(option_snapshot, candle_snapshot=None, option_evidence=None):
+    """Return a conservative selected-option long-entry gate from broker-backed data only."""
+    snapshot = option_snapshot if isinstance(option_snapshot, dict) else {}
+    candles = candle_snapshot if isinstance(candle_snapshot, dict) else {}
+    evidence = option_evidence if isinstance(option_evidence, dict) else {}
+    summary = evidence.get("summary") if isinstance(evidence.get("summary"), dict) else {}
+    total_checks = max(10, _as_int(summary.get("total_check_count")) or 10)
+    usable_checks = max(0, _as_int(summary.get("usable_check_count")) or 0)
+    bullish = max(0, _as_int(summary.get("buy_score")) or 0)
+    bearish = max(0, _as_int(summary.get("sell_score")) or 0)
+    neutral = max(0, _as_int(summary.get("neutral_count")) or 0)
+    regime = str(summary.get("regime") or "INSUFFICIENT_DATA")
+    candle_message = str(candles.get("message") or evidence.get("message") or "Current-session broker candles are required.")
+
+    if not snapshot.get("ok"):
+        return {
+            "decision": "WAIT / NEUTRAL",
+            "decision_note": "NOT A BUY",
+            "conditions": f"0 / {total_checks} verified",
+            "condition_detail": "Broker candles are not verified yet",
+            "risk_status": "LOCKED",
+            "message": "Risk, entry, stop, target, and BUY are locked until Angel One returns this contract's real LTP and current-session candles.",
+            "allow_risk_preview": False,
+            "allow_long_entry": False,
+            "tone": "fo-gate-wait",
+        }
+
+    condition_detail = f"Bullish {bullish} · Bearish {bearish} · Neutral {neutral}"
+    if not candles.get("ok") or regime == "INSUFFICIENT_DATA":
+        return {
+            "decision": "WAIT / NEUTRAL",
+            "decision_note": "NOT A BUY",
+            "conditions": f"{usable_checks} / {total_checks} usable",
+            "condition_detail": condition_detail,
+            "risk_status": "PLAN ONLY",
+            "message": f"A real broker LTP is available, but the long entry stays locked until at least 21 current-session candles produce a complete intraday check. {candle_message}",
+            "allow_risk_preview": True,
+            "allow_long_entry": False,
+            "tone": "fo-gate-wait",
+        }
+
+    if regime == "BULLISH":
+        return {
+            "decision": "CONDITIONAL LONG REVIEW",
+            "decision_note": "NOT AN AUTOMATIC BUY",
+            "conditions": f"{usable_checks} / {total_checks} usable",
+            "condition_detail": condition_detail,
+            "risk_status": "RISK PLAN READY",
+            "message": "The selected option premium passed the intraday evidence gate. Review the broker quote, quantity, stop, target, and order confirmation yourself before any entry.",
+            "allow_risk_preview": True,
+            "allow_long_entry": True,
+            "tone": "fo-gate-bull",
+        }
+
+    if regime == "BEARISH":
+        return {
+            "decision": "BEARISH / NO LONG BUY",
+            "decision_note": "BUY LOCKED",
+            "conditions": f"{usable_checks} / {total_checks} usable",
+            "condition_detail": condition_detail,
+            "risk_status": "PLAN ONLY",
+            "message": "The selected option premium has bearish evidence. A long-option BUY is locked; SELL values remain illustrative and live short options still require a separate margin/preflight check.",
+            "allow_risk_preview": True,
+            "allow_long_entry": False,
+            "tone": "fo-gate-bear",
+        }
+
+    return {
+        "decision": "NEUTRAL / NO TRADE",
+        "decision_note": "BUY LOCKED",
+        "conditions": f"{usable_checks} / {total_checks} usable",
+        "condition_detail": condition_detail,
+        "risk_status": "PLAN ONLY",
+        "message": "The selected option premium is mixed or sideways. This is a wait state, not a BUY signal; risk values are shown only for planning.",
+        "allow_risk_preview": True,
+        "allow_long_entry": False,
+        "tone": "fo-gate-wait",
+    }
+
+
+def option_setup_from_evidence(option_evidence):
+    """Classify a broker-candle premium scan without treating neutral as a sell signal."""
+    evidence = option_evidence if isinstance(option_evidence, dict) else {}
+    summary = evidence.get("summary") if isinstance(evidence.get("summary"), dict) else {}
+    regime = str(summary.get("regime") or "INSUFFICIENT_DATA")
+    metrics = evidence.get("metrics") if isinstance(evidence.get("metrics"), dict) else {}
+    rsi_value = _as_float(metrics.get("rsi"))
+    if regime == "INSUFFICIENT_DATA":
+        return "DATA_REQUIRED"
+    if rsi_value is not None and (rsi_value >= 74.0 or rsi_value <= 26.0):
+        return "REVERSAL_WATCH"
+    if regime == "BULLISH":
+        return "BUY_SETUP"
+    if regime == "BEARISH":
+        return "BEARISH_SETUP"
+    return "CONSOLIDATION"
+
+
+def _fo_currency(value):
+    number = _as_float(value)
+    return "—" if number is None else f"₹{number:,.2f}"
+
+
+def _fo_percent(value):
+    number = _as_float(value)
+    return "—" if number is None else f"{number:+.2f}%"
+
+
+def build_fo_intelligence_row(contract, option_snapshot, candle_snapshot, option_evidence):
+    """Create one selected-contract row using only values received from Angel One."""
+    selected_contract = contract if isinstance(contract, dict) else {}
+    snapshot = option_snapshot if isinstance(option_snapshot, dict) else {}
+    candles = candle_snapshot if isinstance(candle_snapshot, dict) else {}
+    evidence = option_evidence if isinstance(option_evidence, dict) else {}
+    summary = evidence.get("summary") if isinstance(evidence.get("summary"), dict) else {}
+    metrics = evidence.get("metrics") if isinstance(evidence.get("metrics"), dict) else {}
+    quote_ok = bool(snapshot.get("ok"))
+    complete_candles = bool(candles.get("ok")) and str(summary.get("regime")) != "INSUFFICIENT_DATA"
+    ltp = _as_float(snapshot.get("ltp"))
+    broker_close = _as_float(snapshot.get("close"))
+    quote_change = ((ltp - broker_close) / broker_close * 100.0) if ltp is not None and broker_close and broker_close > 0 else None
+    setup = option_setup_from_evidence(evidence)
+
+    if not quote_ok:
+        trend, setup, verification = "WAIT / NEUTRAL", "DATA_REQUIRED", "Angel One LTP required"
+    elif not complete_candles:
+        trend, setup, verification = "WAIT / DATA REQUIRED", "DATA_REQUIRED", "LTP received; current-session candles incomplete"
+    else:
+        trend = str(summary.get("regime") or "SIDEWAYS / NO TRADE")
+        candle_count = _as_int(metrics.get("candle_count")) or 0
+        verification = f"LTP + {candle_count} current-session broker candles"
+
+    score_available = complete_candles
+    return {
+        "Contract": str(selected_contract.get("symbol") or "—"),
+        "Premium": _fo_currency(ltp if quote_ok else None),
+        "LTP Chg%": _fo_percent(quote_change),
+        "Trend": trend,
+        "VWAP": _fo_currency(metrics.get("vwap") if complete_candles else None),
+        "RSI": "—" if not complete_candles or _as_float(metrics.get("rsi")) is None else f"{_as_float(metrics.get('rsi')):.1f}",
+        "Buy": f"{_as_int(summary.get('buy_score')) or 0}/10" if score_available else "— / 10",
+        "Sell": f"{_as_int(summary.get('sell_score')) or 0}/10" if score_available else "— / 10",
+        "Setup": setup,
+        "Verification": verification,
+    }
+
+
+def choose_fo_contract(contracts, selected_token=None):
+    """Return a stable visible F&O contract; never infer CE/PE or a strike."""
+    visible_contracts = [row for row in contracts or [] if isinstance(row, dict) and row.get("token")]
+    if not visible_contracts:
+        return None
+    wanted_token = str(selected_token or "")
+    return next((row for row in visible_contracts if str(row.get("token")) == wanted_token), visible_contracts[0])
+
+
+def build_fo_contract_watchlist_rows(contracts, selected_contract, option_snapshot, candle_snapshot, option_evidence):
+    """Build a metadata-first F&O table without fabricating unselected premiums.
+
+    Angel One's master verifies every row's contract identity.  Only the one
+    selected token can show premium/candle-derived fields because the app does
+    not request a deceptive all-contract quote or candle scan.
+    """
+    selected_token = str((selected_contract or {}).get("token") or "")
+    selected_intelligence = build_fo_intelligence_row(
+        selected_contract, option_snapshot, candle_snapshot, option_evidence,
+    ) if selected_token else {}
+    rows = []
+    for contract in contracts or []:
+        token = str(contract.get("token") or "")
+        selected = bool(selected_token and token == selected_token)
+        rows.append({
+            "Contract": str(contract.get("symbol") or "—"),
+            "Expiry": str(contract.get("expiry_label") or contract.get("expiry_raw") or "—"),
+            "Side": "CALL (CE)" if contract.get("side") == "CE" else "PUT (PE)" if contract.get("side") == "PE" else "—",
+            "Strike": _as_float(contract.get("strike")),
+            "Lot": _as_int(contract.get("lot_size")),
+            "Tick": _as_float(contract.get("tick_size")),
+            "Premium": selected_intelligence.get("Premium", "—") if selected else "—",
+            "Trend": selected_intelligence.get("Trend", "—") if selected else "—",
+            "Buy": selected_intelligence.get("Buy", "— / 10") if selected else "— / 10",
+            "Sell": selected_intelligence.get("Sell", "— / 10") if selected else "— / 10",
+            "Setup": selected_intelligence.get("Setup", "—") if selected else "—",
+            "Data status": selected_intelligence.get("Verification", "—") if selected else "MASTER VERIFIED · SELECT TO LOAD",
+        })
+    return rows
+
+
+def build_fo_verification_rows(contract, option_snapshot, candle_snapshot, option_evidence, selected_greeks=None):
+    """Expose what is and is not verified for the selected F&O contract."""
+    selected_contract = contract if isinstance(contract, dict) else {}
+    snapshot = option_snapshot if isinstance(option_snapshot, dict) else {}
+    candles = candle_snapshot if isinstance(candle_snapshot, dict) else {}
+    evidence = option_evidence if isinstance(option_evidence, dict) else {}
+    summary = evidence.get("summary") if isinstance(evidence.get("summary"), dict) else {}
+    metrics = evidence.get("metrics") if isinstance(evidence.get("metrics"), dict) else {}
+    candle_count = _as_int(metrics.get("candle_count")) or 0
+    complete_evidence = bool(candles.get("ok")) and str(summary.get("regime")) != "INSUFFICIENT_DATA"
+    greeks = selected_greeks if isinstance(selected_greeks, dict) else {}
+    metadata_ok = bool(selected_contract.get("token") and selected_contract.get("symbol") and selected_contract.get("lot_size"))
+    return [
+        {
+            "Verification": "Selected contract metadata",
+            "State": "VERIFIED" if metadata_ok else "UNAVAILABLE",
+            "Detail": "Angel One NFO instrument master" if metadata_ok else "A valid broker-listed contract is required.",
+        },
+        {
+            "Verification": "Selected option premium (LTP)",
+            "State": "VERIFIED" if snapshot.get("ok") else "UNAVAILABLE",
+            "Detail": str(snapshot.get("source") or "Angel One SmartAPI LTP") if snapshot.get("ok") else str(snapshot.get("message") or "Angel One quote required."),
+        },
+        {
+            "Verification": "Current-session option candles",
+            "State": "VERIFIED" if complete_evidence else "INCOMPLETE",
+            "Detail": f"{candle_count} usable broker candles · current IST session" if complete_evidence else str(candles.get("message") or evidence.get("message") or "At least 21 current-session broker candles are required."),
+        },
+        {
+            "Verification": "10-point selected-premium scan",
+            "State": "VERIFIED" if complete_evidence else "INCOMPLETE",
+            "Detail": f"Buy {_as_int(summary.get('buy_score')) or 0}/10 · Sell {_as_int(summary.get('sell_score')) or 0}/10 · {summary.get('regime')}" if complete_evidence else "No score is inferred while candle evidence is incomplete.",
+        },
+        {
+            "Verification": "Raw Greeks / OI",
+            "State": "VERIFIED RAW" if greeks else "NOT RETURNED",
+            "Detail": ", ".join(str(key) for key in greeks) if greeks else "Only shown if Angel One returns a safely matched selected-contract record.",
+        },
+        {
+            "Verification": "Underlying direction / chain flow",
+            "State": "NOT VERIFIED HERE",
+            "Detail": "This screen does not claim NIFTY/stock direction, PCR, OI buildup, bid/ask depth, or option-chain flow without a separate broker source.",
+        },
+    ]
+
+
+def parse_official_rss_items(payload, source_name, source_url, limit=10):
+    """Parse headline metadata only; no publisher article text is copied into the app."""
+    try:
+        root = ET.fromstring(payload)
+    except (ET.ParseError, TypeError, ValueError) as exc:
+        raise ValueError(f"{source_name} did not return a readable RSS/Atom feed.") from exc
+    items = []
+    for element in root.findall(".//item") + root.findall(".//{*}entry"):
+        title = (element.findtext("title") or element.findtext("{*}title") or "").strip()
+        link = (element.findtext("link") or "").strip()
+        atom_link = element.find("{*}link")
+        if atom_link is not None and atom_link.get("href"):
+            link = atom_link.get("href").strip()
+        published = (
+            element.findtext("pubDate") or element.findtext("published") or
+            element.findtext("updated") or element.findtext("{*}published") or element.findtext("{*}updated") or ""
+        ).strip()
+        if title:
+            items.append({"source": source_name, "source_url": source_url, "title": title, "link": link or source_url, "published": published})
+        if len(items) >= limit:
+            break
+    return items
+
+
+def fetch_official_news_feeds(source_configs, urlopen_fn=None, limit_per_source=8):
+    """Fetch source-attributed official headlines and preserve source-specific failures."""
+    opener = urlopen_fn or urllib.request.urlopen
+    items, errors = [], []
+    for source in source_configs:
+        name, url = str(source["name"]), str(source["url"])
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "MahiTrading/1.0", "Accept": "application/rss+xml,application/atom+xml,application/xml,text/xml,*/*"})
+            with opener(request, timeout=12) as response:
+                payload = response.read()
+            items.extend(parse_official_rss_items(payload, name, url, limit=limit_per_source))
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+    return {
+        "items": items,
+        "errors": errors,
+        "fetched_at": ist_now().strftime("%Y-%m-%d %H:%M:%S %Z"),
     }
 
 
@@ -522,11 +1859,11 @@ def build_live_order_params(contract, quantity, action, order_kind, limit_price=
 
 
 def fetch_selected_option_snapshot(smart_api, contract):
-    """Request the broker LTP for exactly one selected option contract."""
+    """Request the broker LTP for exactly one selected broker instrument."""
     if smart_api is None:
         return {"ok": False, "state": "disconnected", "message": "Angel One is not connected."}
     if not contract or not contract.get("token") or not contract.get("symbol"):
-        return {"ok": False, "state": "invalid_contract", "message": "Select a valid Angel One option contract."}
+        return {"ok": False, "state": "invalid_contract", "message": "Select a valid Angel One broker instrument."}
     try:
         response = smart_api.ltpData(contract.get("exchange", "NFO"), contract["symbol"], str(contract["token"]))
     except Exception as exc:
@@ -539,7 +1876,7 @@ def fetch_selected_option_snapshot(smart_api, contract):
         data = data[0] if data else {}
     ltp = _as_float(data.get("ltp") or data.get("last_traded_price")) if isinstance(data, dict) else None
     if ltp is None or ltp <= 0:
-        return {"ok": False, "state": "unavailable", "message": "Broker response contains no usable option LTP."}
+        return {"ok": False, "state": "unavailable", "message": "Broker response contains no usable LTP."}
     return {
         "ok": True,
         "state": "snapshot",
@@ -613,7 +1950,7 @@ def fetch_option_candles(smart_api, contract, interval="FIVE_MINUTE"):
         return {"ok": False, "state": "disconnected", "message": "Angel One is not connected.", "candles": []}
     if not hasattr(smart_api, "getCandleData"):
         return {"ok": False, "state": "unavailable", "message": "Installed SmartAPI client has no candle-data method.", "candles": []}
-    now = datetime.now()
+    now = ist_now().replace(tzinfo=None)
     params = {
         "exchange": contract.get("exchange", "NFO"),
         "symboltoken": str(contract.get("token", "")),
@@ -658,9 +1995,75 @@ def run_self_tests():
 
     connected = fetch_selected_option_snapshot(MockSmartApi(), contract)
     assert connected["ok"] is True and connected["ltp"] == 123.45
-    master = [{"exch_seg": "NFO", "instrumenttype": "OPTIDX", "symbol": "NIFTY26SEP25000CE", "name": "NIFTY", "expiry": "26SEP2026", "strike": "2500000.000000", "lotsize": "65", "tick_size": "5.000000", "token": "12345"}]
+    future_expiry = (ist_now().date() + timedelta(days=7)).strftime("%d%b%Y").upper()
+    master = [{"exch_seg": "NFO", "instrumenttype": "OPTIDX", "symbol": "NIFTY26SEP25000CE", "name": "NIFTY", "expiry": future_expiry, "strike": "2500000.000000", "lotsize": "65", "tick_size": "5.000000", "token": "12345"}]
     parsed = extract_option_contracts(master, "NIFTY")
     assert len(parsed) == 1 and parsed[0]["strike"] == 25000.0 and parsed[0]["lot_size"] == 65 and parsed[0]["tick_size"] == 0.05
+
+    def fo_master_row(exchange, instrument_type, symbol, name, token, strike="", lot_size="", tick=""):
+        return {
+            "exch_seg": exchange, "instrumenttype": instrument_type, "symbol": symbol,
+            "name": name, "token": token, "expiry": future_expiry,
+            "strike": strike, "lotsize": lot_size, "tick_size": tick,
+        }
+
+    fo_master = [
+        fo_master_row("NSE", "AMXIDX", "NIFTY 50", "NIFTY", "99926000"),
+        fo_master_row("BSE", "AMXIDX", "SENSEX", "SENSEX", "99919000"),
+        fo_master_row("NFO", "OPTIDX", "NIFTYTEST25000CE", "NIFTY", "nce1", "2500000", "65", "5"),
+        fo_master_row("NFO", "OPTIDX", "NIFTYTEST25000PE", "NIFTY", "npe1", "2500000", "65", "5"),
+        fo_master_row("NFO", "OPTIDX", "NIFTYTEST25100CE", "NIFTY", "nce2", "2510000", "65", "5"),
+        fo_master_row("NFO", "OPTIDX", "NIFTYTEST25100PE", "NIFTY", "npe2", "2510000", "65", "5"),
+        fo_master_row("BFO", "OPTIDX", "SENSEXTEST80000CE", "SENSEX", "sce1", "8000000", "10", "5"),
+        fo_master_row("BFO", "OPTIDX", "SENSEXTEST80000PE", "SENSEX", "spe1", "8000000", "10", "5"),
+        fo_master_row("NFO", "OPTSTK", "RELIANCETEST2500CE", "RELIANCE", "stock1", "250000", "250", "5"),
+    ]
+    assert set(FO_INDEX_UNIVERSE) == {"NIFTY 50", "BANKNIFTY", "FINNIFTY", "SENSEX", "NIFT Midcap"}
+    nifty_contracts = resolve_fo_index_option_contracts(fo_master, "NIFTY 50")
+    sensex_contracts = resolve_fo_index_option_contracts(fo_master, "SENSEX")
+    assert len(nifty_contracts) == 4 and all(row["exchange"] == "NFO" and row["instrument_type"] == "OPTIDX" for row in nifty_contracts)
+    assert len(sensex_contracts) == 2 and all(row["exchange"] == "BFO" for row in sensex_contracts)
+    assert resolve_fo_index_option_contracts(fo_master, "NIFT Midcap") == []
+    assert resolve_fo_index_spot_contract(fo_master, "NIFTY 50")["exchange"] == "NSE"
+    assert resolve_fo_index_spot_contract(fo_master, "SENSEX")["exchange"] == "BSE"
+    nifty_pairs = pair_fo_index_contracts(nifty_contracts)
+    assert nearest_fo_chain_strike(nifty_pairs, 25062.0) == 25100.0
+    assert len(fo_chain_band(nifty_pairs, 25000.0, 1)) == 2
+    assert fo_contract_key(nifty_contracts[0]) != fo_contract_key(sensex_contracts[0])
+
+    class MockMarketDataApi:
+        def getMarketData(self, mode, exchange_tokens):
+            assert mode == "FULL" and exchange_tokens == {"NFO": ["nce1", "npe1", "nce2", "npe2"]}
+            return {
+                "status": True,
+                "data": {"fetched": [
+                    {"exchange": "NFO", "symbolToken": "nce1", "ltp": 110.5, "close": 100.0, "percentChange": 10.5, "tradeVolume": 1234, "opnInterest": 888, "best5Data": [{"flag": "BUY", "price": 110.4}, {"flag": "SELL", "price": 110.6}]},
+                    {"exchange": "NFO", "symbolToken": "npe1", "ltp": 90.5, "close": 92.0},
+                    {"exchange": "NFO", "symbolToken": "nce2", "ltp": 75.0},
+                    {"exchange": "NFO", "symbolToken": "npe2", "ltp": 120.0},
+                ]},
+            }
+
+    chain_connected = fetch_broker_market_data(MockMarketDataApi(), nifty_contracts)
+    assert chain_connected["ok"] and chain_connected["state"] == "snapshot" and chain_connected["fetched_count"] == 4
+    chain_ce_quote = quote_for_fo_contract(chain_connected, nifty_pairs[25000.0]["CE"])
+    assert chain_ce_quote["ltp"] == 110.5 and chain_ce_quote["bid"] == 110.4 and chain_ce_quote["ask"] == 110.6 and chain_ce_quote["open_interest"] == 888.0
+    chain_disconnected = fetch_broker_market_data(None, nifty_contracts)
+    assert not chain_disconnected["ok"] and chain_disconnected["state"] == "disconnected" and not chain_disconnected["quotes"]
+
+    bullish_summary = {"regime": "BULLISH", "usable_check_count": 8}
+    bearish_summary = {"regime": "BEARISH", "usable_check_count": 8}
+    neutral_summary = {"regime": "SIDEWAYS / NO TRADE", "usable_check_count": 8}
+    ready_option_gate = {"allow_risk_preview": True, "allow_long_entry": True, "risk_status": "RISK PLAN READY", "tone": "fo-gate-bull", "decision": "CONDITIONAL LONG REVIEW"}
+    composite_ce = build_fo_composite_gate({"ok": True}, {"summary": bullish_summary}, nifty_pairs[25000.0]["CE"], ready_option_gate, {"summary": bullish_summary})
+    assert composite_ce["allow_long_entry"] and composite_ce["decision"] == "CONDITIONAL CE LONG REVIEW"
+    composite_sideways = build_fo_composite_gate({"ok": True}, {"summary": neutral_summary}, nifty_pairs[25000.0]["CE"], ready_option_gate, {"summary": bullish_summary})
+    assert not composite_sideways["allow_long_entry"] and composite_sideways["decision"] == "NEUTRAL / NO TRADE"
+    composite_mismatch = build_fo_composite_gate({"ok": True}, {"summary": bearish_summary}, nifty_pairs[25000.0]["CE"], ready_option_gate, {"summary": bullish_summary})
+    assert not composite_mismatch["allow_long_entry"] and composite_mismatch["decision"] == "DIRECTION MISMATCH / NO TRADE"
+    unconfirmed_pe_gate = dict(ready_option_gate, allow_long_entry=False)
+    composite_unconfirmed_pe = build_fo_composite_gate({"ok": True}, {"summary": bearish_summary}, nifty_pairs[25000.0]["PE"], unconfirmed_pe_gate, {"summary": bullish_summary})
+    assert not composite_unconfirmed_pe["allow_long_entry"] and "premium" in composite_unconfirmed_pe["message"].lower()
 
     good_chart = pd.DataFrame({
         "Open": [100.0, 101.0], "High": [102.0, 103.0],
@@ -677,6 +2080,33 @@ def run_self_tests():
         "OFFLINE.NS", download_fn=lambda *args, **kwargs: (_ for _ in ()).throw(OSError("offline")),
     )
     assert failed_chart.empty and "request failed" in failed_chart_message
+
+    direct_chart_payload = json.dumps({
+        "chart": {"result": [{
+            "timestamp": [1_790_000_000, 1_790_000_900],
+            "indicators": {"quote": [{
+                "open": [100.0, 101.0], "high": [101.0, 102.0],
+                "low": [99.0, 100.0], "close": [100.5, 101.5], "volume": [10, 12],
+            }]},
+        }], "error": None}
+    }).encode("utf-8")
+
+    class MockDirectChartResponse:
+        status = 200
+
+        def read(self):
+            return direct_chart_payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    direct_chart, direct_chart_error = fetch_direct_yahoo_chart_data(
+        "MOCK.NS", "5d", "15m", lambda request, timeout: MockDirectChartResponse()
+    )
+    assert not direct_chart_error and len(direct_chart) == 2 and float(direct_chart["Close"].iloc[-1]) == 101.5
 
     constituent_csv = (
         b"\xef\xbb\xbfCompany Name,Industry,Symbol,Series,ISIN Code\n"
@@ -712,6 +2142,40 @@ def run_self_tests():
         raise AssertionError("A missing Symbol column must be rejected.")
     except ValueError as exc:
         assert "Symbol column" in str(exc)
+
+    bse_constituent_csv = (
+        b"Constituents,Symbol,Macro-Economic Sector\n"
+        b"ADANI PORTS AND SPECIAL ECONOM,532921,Services\n"
+        b"RELIANCE INDUSTRIES LTD.,500325,Energy\n"
+    )
+    assert parse_official_bse_sensex_constituent_csv(bse_constituent_csv) == [
+        "ADANIPORTS.NS", "RELIANCE.NS",
+    ]
+
+    class MockBseConstituentResponse(MockConstituentResponse):
+        def read(self):
+            return bse_constituent_csv
+
+    bse_source = {
+        "url": "https://www.bseindices.com/AsiaIndexAPI/api/Codewise_IndicesDownload/w?code=16",
+        "minimum": 2,
+        "maximum": 2,
+        "parser": "bse_sensex",
+        "publisher": "Test BSE constituent CSV",
+    }
+    bse_symbols, bse_error, bse_metadata = fetch_official_index_constituents(
+        bse_source, lambda request, timeout: MockBseConstituentResponse()
+    )
+    assert bse_symbols == ["ADANIPORTS.NS", "RELIANCE.NS"] and not bse_error
+    assert bse_metadata["publisher"] == "Test BSE constituent CSV"
+    try:
+        parse_official_bse_sensex_constituent_csv(
+            b"Constituents,Symbol,Macro-Economic Sector\nUNKNOWN LTD.,999999,Services\n"
+        )
+        raise AssertionError("An unmapped BSE scrip code must be rejected rather than guessed.")
+    except ValueError as exc:
+        assert "reviewed public-chart mapping" in str(exc)
+
     unavailable_symbols, unavailable_error, _ = fetch_official_index_constituents(
         constituent_source,
         lambda request, timeout: (_ for _ in ()).throw(OSError("source offline")),
@@ -744,6 +2208,113 @@ def run_self_tests():
     )
     assert rows == master and not master_error and master_source.endswith("OpenAPIScripMaster.json")
     assert attempted_urls == ["https://example.invalid/old.json", "https://example.valid/OpenAPIScripMaster.json"]
+
+    try:
+        calculate_directional_preview("SELL", 20, 5, 25, 1)
+        raise AssertionError("A SELL target below zero must be rejected.")
+    except ValueError as exc:
+        assert "invalid" in str(exc).lower()
+    strong_bull = summarize_directional_evidence([
+        ("A", "BULLISH", ""), ("B", "BULLISH", ""), ("C", "BULLISH", ""),
+        ("D", "BULLISH", ""), ("E", "BULLISH", ""), ("F", "BULLISH", ""),
+        ("G", "NEUTRAL", ""), ("H", "BEARISH", ""),
+    ])
+    assert strong_bull["regime"] == "BULLISH" and strong_bull["buy_score"] == 6 and strong_bull["sell_score"] == 1
+    sideways = summarize_directional_evidence([
+        ("A", "NEUTRAL", ""), ("B", "NEUTRAL", ""), ("C", "NEUTRAL", ""),
+        ("D", "BULLISH", ""), ("E", "BEARISH", ""), ("F", "NEUTRAL", ""),
+    ], min_usable=6, threshold=5)
+    assert sideways["regime"] == "SIDEWAYS / NO TRADE" and sideways["buy_score"] + sideways["sell_score"] < 6
+    long_policy = trade_policy_for_horizon("Long Term (Weekly)")
+    assert long_policy["allowed_actions"] == {"BUY"}
+    assert validate_equity_trade_policy("Long Term (Weekly)", "BUY", "NORMAL", "DELIVERY")[0]
+    assert not validate_equity_trade_policy("Long Term (Weekly)", "SELL", "NORMAL", "DELIVERY")[0]
+    assert not validate_equity_trade_policy("Long Term (Weekly)", "BUY", "ROBO", "DELIVERY")[0]
+    assert market_scan_action("BULLISH", "Intraday (15-Min)") == "BUY REVIEW"
+    assert market_scan_action("BEARISH", "Intraday (15-Min)") == "SELL REVIEW"
+    assert market_scan_action("BEARISH", "Long Term (Weekly)") == "BEARISH / NO NEW BUY"
+    assert market_scan_action("SIDEWAYS / NO TRADE", "Intraday (15-Min)") == "NEUTRAL / NO TRADE"
+
+    scan_index = pd.date_range("2026-09-25 09:15", periods=60, freq="15min")
+    scan_close = np.linspace(100.0, 118.0, len(scan_index))
+    scan_good = pd.DataFrame({
+        "Open": scan_close - 0.20,
+        "High": scan_close + 0.60,
+        "Low": scan_close - 0.60,
+        "Close": scan_close,
+        "Volume": np.linspace(1000, 2200, len(scan_index)),
+    }, index=scan_index)
+    scan_missing = pd.DataFrame({column: [np.nan] * len(scan_index) for column in scan_good.columns}, index=scan_index)
+    scan_daily_index = pd.date_range("2026-06-01", periods=80, freq="B")
+    scan_daily = pd.DataFrame({
+        "Open": np.linspace(80.0, 117.0, len(scan_daily_index)),
+        "High": np.linspace(81.0, 118.0, len(scan_daily_index)),
+        "Low": np.linspace(79.0, 116.0, len(scan_daily_index)),
+        "Close": np.linspace(80.5, 117.5, len(scan_daily_index)),
+        "Volume": np.linspace(10000, 12000, len(scan_daily_index)),
+    }, index=scan_daily_index)
+    scan_batch = pd.concat({"GOOD.NS": scan_good, "MISSING.NS": scan_missing}, axis=1)
+    scan_daily_batch = pd.concat({"GOOD.NS": scan_daily, "MISSING.NS": scan_missing}, axis=1)
+    scan_rows, scan_checklists, scan_prices = evaluate_equity_intelligence_scan(
+        ["GOOD.NS", "MISSING.NS"], scan_batch, scan_daily_batch, 3,
+    )
+    assert len(scan_rows) == 2 and set(scan_rows["Symbol"]) == {"GOOD", "MISSING"}
+    assert scan_rows.loc[scan_rows["Symbol"] == "MISSING", "Trend"].iloc[0] == "DATA UNAVAILABLE"
+    assert "GOOD" in scan_checklists and scan_prices["GOOD"] > 0
+
+    class MockCandleApi:
+        def __init__(self):
+            self.interval = ""
+
+        def getCandleData(self, params):
+            self.interval = params["interval"]
+            return {"status": True, "data": [["2026-09-26 09:15", 100, 101, 99, 100, 12]]}
+
+    mock_candle_api = MockCandleApi()
+    candle_response = fetch_option_candles(mock_candle_api, contract, interval="FIFTEEN_MINUTE")
+    assert candle_response["ok"] and mock_candle_api.interval == "FIFTEEN_MINUTE"
+    today = ist_now().date()
+    candle_times = pd.date_range(f"{today.isoformat()} 09:15", periods=25, freq="5min", tz=IST_TIMEZONE)
+    flat_candles = pd.DataFrame({
+        "time": candle_times, "Open": [100.0] * 25, "High": [101.0] * 25,
+        "Low": [99.0] * 25, "Close": [100.0] * 25, "Volume": [100.0] * 25,
+    })
+    flat_evidence = evaluate_intraday_option_evidence(flat_candles)
+    assert flat_evidence["summary"]["regime"] == "SIDEWAYS / NO TRADE" and len(flat_evidence["checks"]) == 10
+    disconnected_gate = build_fo_trade_gate(disconnected, {"ok": False, "message": "Angel One is not connected."})
+    assert disconnected_gate["decision"] == "WAIT / NEUTRAL" and not disconnected_gate["allow_long_entry"]
+    flat_gate = build_fo_trade_gate({"ok": True, "ltp": 100.0}, {"ok": True}, flat_evidence)
+    assert flat_gate["decision"] == "NEUTRAL / NO TRADE" and not flat_gate["allow_long_entry"]
+    bull_gate = build_fo_trade_gate({"ok": True, "ltp": 100.0}, {"ok": True}, {"summary": strong_bull})
+    assert bull_gate["decision"] == "CONDITIONAL LONG REVIEW" and bull_gate["allow_long_entry"]
+    scan_contract = {"symbol": "NIFTY26SEP25000CE", "token": "12345", "lot_size": 65}
+    disconnected_scan = build_fo_intelligence_row(scan_contract, disconnected, {"ok": False}, {})
+    assert disconnected_scan["Premium"] == "—" and disconnected_scan["Buy"] == "— / 10"
+    verified_scan = build_fo_intelligence_row(scan_contract, connected, {"ok": True}, flat_evidence)
+    assert verified_scan["Trend"] == "SIDEWAYS / NO TRADE" and verified_scan["Buy"] == "0/10"
+    second_scan_contract = {
+        "symbol": "NIFTY26SEP25100PE", "token": "67890", "lot_size": 65,
+        "expiry_label": "26 Sep 2026", "expiry_raw": "26SEP2026", "side": "PE",
+        "strike": 25100.0, "tick_size": 0.05,
+    }
+    scan_contract.update({
+        "expiry_label": "26 Sep 2026", "expiry_raw": "26SEP2026", "side": "CE",
+        "strike": 25000.0, "tick_size": 0.05,
+    })
+    assert choose_fo_contract([scan_contract, second_scan_contract], "67890") == second_scan_contract
+    assert choose_fo_contract([scan_contract, second_scan_contract], "missing") == scan_contract
+    fo_watchlist = build_fo_contract_watchlist_rows(
+        [scan_contract, second_scan_contract], scan_contract, connected, {"ok": True}, flat_evidence,
+    )
+    assert fo_watchlist[0]["Premium"] == "₹123.45" and fo_watchlist[1]["Premium"] == "—"
+    assert fo_watchlist[1]["Data status"] == "MASTER VERIFIED · SELECT TO LOAD"
+    verification_rows = build_fo_verification_rows(scan_contract, connected, {"ok": True}, flat_evidence, {"Delta": 0.5})
+    assert verification_rows[0]["State"] == "VERIFIED" and verification_rows[-1]["State"] == "NOT VERIFIED HERE"
+    parsed_news = parse_official_rss_items(
+        b"<rss><channel><item><title>Official update</title><link>https://example.test/item</link><pubDate>Today</pubDate></item></channel></rss>",
+        "Test regulator", "https://example.test/feed",
+    )
+    assert parsed_news[0]["title"] == "Official update" and parsed_news[0]["link"].endswith("/item")
     print("Mahi Trading self-tests passed.")
 
 
@@ -797,6 +2368,17 @@ st.markdown("""
         color: #ffffff;
         letter-spacing: -0.5px;
         line-height: 1.1;
+    }
+    .brand-logo {
+        width: 52px;
+        height: 52px;
+        object-fit: contain;
+        margin-right: 13px;
+        filter: drop-shadow(0 5px 12px rgba(34, 211, 238, 0.25));
+    }
+    .brand-block {
+        display: flex;
+        align-items: center;
     }
     .brand-accent {
         background: linear-gradient(90deg, #00f2fe, #4facfe, #a855f7);
@@ -872,6 +2454,8 @@ st.markdown("""
     }
     .tag-bull { color: #34d399; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
     .tag-bear { color: #fb7185; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+    .tag-neutral { color: #fbbf24; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+    .tag-muted { color: #94a3b8; font-weight: 600; font-family: 'JetBrains Mono', monospace; }
 
     .calc-box {
         background: linear-gradient(135deg, rgba(15, 23, 42, 0.9) 0%, rgba(30, 27, 75, 0.7) 100%);
@@ -936,6 +2520,18 @@ st.markdown("""
         color: #ffffff;
         background: linear-gradient(135deg, rgba(14, 116, 144, 0.55), rgba(91, 33, 182, 0.5));
     }
+    div[class*="st-key-fo_index_"] button {
+        min-height: 46px;
+        font-size: 12px;
+        letter-spacing: 0.15px;
+        border-color: rgba(56, 189, 248, 0.40) !important;
+    }
+    div[class*="st-key-fo_index_"] button[kind="primary"] {
+        background: linear-gradient(135deg, #0e7490, #4338ca) !important;
+        border-color: #22d3ee !important;
+        color: #ecfeff !important;
+        box-shadow: 0 8px 22px rgba(34, 211, 238, 0.22) !important;
+    }
     div[data-testid="stRadio"] label {
         background: rgba(15, 23, 42, 0.75);
         border: 1px solid rgba(148, 163, 184, 0.20);
@@ -998,6 +2594,81 @@ st.markdown("""
         color: #dcfce7;
         font-size: 12px;
     }
+    .fo-trade-gate {
+        background: linear-gradient(135deg, rgba(15, 23, 42, 0.92), rgba(30, 27, 75, 0.72));
+        border: 1px solid rgba(148, 163, 184, 0.26);
+        border-radius: 12px;
+        padding: 15px 17px;
+        margin: 14px 0;
+        box-shadow: 0 10px 28px rgba(0, 0, 0, 0.24);
+    }
+    .fo-gate-wait { border-color: rgba(251, 191, 36, 0.52); }
+    .fo-gate-bull { border-color: rgba(74, 222, 128, 0.58); }
+    .fo-gate-bear { border-color: rgba(251, 113, 133, 0.58); }
+    .fo-gate-heading {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: center;
+        color: #e2e8f0;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.7px;
+    }
+    .fo-gate-decision {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 11px;
+        border-radius: 999px;
+        padding: 5px 9px;
+        background: rgba(15, 23, 42, 0.82);
+    }
+    .fo-gate-wait .fo-gate-decision { color: #fcd34d; border: 1px solid rgba(251, 191, 36, 0.42); }
+    .fo-gate-bull .fo-gate-decision { color: #86efac; border: 1px solid rgba(74, 222, 128, 0.42); }
+    .fo-gate-bear .fo-gate-decision { color: #fda4af; border: 1px solid rgba(251, 113, 133, 0.42); }
+    .fo-gate-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+        margin: 13px 0 9px;
+    }
+    .fo-gate-stat {
+        background: rgba(2, 6, 23, 0.40);
+        border: 1px solid rgba(148, 163, 184, 0.14);
+        border-radius: 8px;
+        padding: 9px 10px;
+    }
+    .fo-gate-label { color: #94a3b8; font-size: 10px; font-weight: 700; letter-spacing: 0.6px; text-transform: uppercase; }
+    .fo-gate-value { color: #f8fafc; font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 800; margin-top: 4px; }
+    .fo-gate-note { color: #cbd5e1; font-size: 11px; line-height: 1.45; }
+    .fo-gate-message { color: #cbd5e1; font-size: 12px; line-height: 1.5; }
+    @media (max-width: 760px) {
+        .fo-gate-heading { align-items: flex-start; flex-direction: column; }
+        .fo-gate-grid { grid-template-columns: 1fr; }
+    }
+    .chart-shell {
+        background: linear-gradient(180deg, rgba(15, 23, 42, 0.94), rgba(9, 14, 30, 0.90));
+        border: 1px solid rgba(56, 189, 248, 0.18);
+        border-radius: 12px;
+        padding: 10px 10px 2px;
+        box-shadow: 0 12px 34px rgba(0, 0, 0, 0.28);
+    }
+    .chart-inspector {
+        background: linear-gradient(180deg, rgba(30, 41, 59, 0.72), rgba(15, 23, 42, 0.82));
+        border: 1px solid rgba(148, 163, 184, 0.16);
+        border-radius: 12px;
+        padding: 16px;
+        min-height: 500px;
+    }
+    .brief-card {
+        background: linear-gradient(135deg, rgba(15, 23, 42, 0.84), rgba(30, 27, 75, 0.62));
+        border: 1px solid rgba(56, 189, 248, 0.20);
+        border-radius: 12px;
+        padding: 16px;
+        height: 100%;
+    }
+    .brief-kicker { color: #67e8f9; font-size: 10px; font-weight: 800; letter-spacing: 1.1px; text-transform: uppercase; }
+    .brief-value { color: #f8fafc; font-size: 23px; font-family: 'JetBrains Mono', monospace; font-weight: 800; margin: 6px 0; }
+    .brief-note { color: #cbd5e1; font-size: 12px; line-height: 1.5; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1008,13 +2679,54 @@ def apply_chart_style(fig, height=520):
         font=dict(color="#94a3b8", family="Plus Jakarta Sans"),
         height=height,
         margin=dict(l=20, r=20, t=30, b=20),
-        xaxis=dict(gridcolor="rgba(255,255,255,0.05)", showgrid=True),
-        yaxis=dict(gridcolor="rgba(255,255,255,0.05)", showgrid=True),
+        hovermode="x unified",
+        dragmode="pan",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        xaxis=dict(gridcolor="rgba(255,255,255,0.05)", showgrid=True, showspikes=True, spikemode="across", spikesnap="cursor", spikecolor="rgba(148,163,184,0.45)"),
+        yaxis=dict(gridcolor="rgba(255,255,255,0.05)", showgrid=True, side="right", showspikes=True, spikemode="across", spikesnap="cursor", spikecolor="rgba(148,163,184,0.45)", tickprefix="₹"),
     )
     return fig
 
 # --- Persistent Paper Trading Engine ---
 PAPER_FILE = "paper_trades.json"
+APP_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
+SAFE_UI_SETTINGS_FILE = os.path.join(APP_DIRECTORY, "mahi_trading_settings.json")
+SAFE_UI_SETTING_KEYS = {
+    "asset_universe", "trading_horizon", "execution_mode", "chart_timeframe", "fo_interval",
+    "fo5_index", "fo5_interval", "fo5_public_timeframe", "fo5_band",
+}
+
+
+def load_safe_ui_settings():
+    """Load only non-secret display preferences; broker credentials are never stored here."""
+    try:
+        with open(SAFE_UI_SETTINGS_FILE, "r", encoding="utf-8") as handle:
+            settings = json.load(handle)
+        if not isinstance(settings, dict):
+            return {}
+        return {key: value for key, value in settings.items() if key in SAFE_UI_SETTING_KEYS}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def save_safe_ui_settings(settings):
+    """Atomically persist only the allow-listed non-sensitive workspace choices."""
+    cleaned = {key: settings[key] for key in SAFE_UI_SETTING_KEYS if key in settings}
+    temporary_path = f"{SAFE_UI_SETTINGS_FILE}.tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as handle:
+            json.dump(cleaned, handle, indent=2, sort_keys=True)
+        os.replace(temporary_path, SAFE_UI_SETTINGS_FILE)
+        return ""
+    except OSError as exc:
+        return f"Could not save non-sensitive workspace settings: {exc}"
+
+
+def clear_all_short_lived_broker_cache():
+    """Forget volatile broker snapshots while leaving the authenticated object untouched."""
+    for key in list(st.session_state.keys()):
+        if key.startswith(("option_snapshot_", "option_greeks_", "option_candles_", "fo5_chain_")):
+            st.session_state.pop(key, None)
 
 def load_paper_account():
     if os.path.exists(PAPER_FILE):
@@ -1212,40 +2924,573 @@ def _cached_broker_result(cache_key, ttl_seconds, fetcher):
 def get_option_snapshot_for_ui(smart_api, contract):
     if smart_api is None:
         return fetch_selected_option_snapshot(None, contract)
+    contract_identity = fo_contract_key(contract)
     return _cached_broker_result(
-        f"option_snapshot_{contract['token']}",
+        f"option_snapshot_{contract_identity}",
         OPTION_SNAPSHOT_TTL_SECONDS,
         lambda: fetch_selected_option_snapshot(smart_api, contract),
     )
 
 
-def get_option_greeks_for_ui(smart_api, underlying, expiry_raw):
+def get_option_greeks_for_ui(smart_api, underlying, expiry_raw, exchange="NFO"):
     if smart_api is None:
         return fetch_option_greeks(None, underlying, expiry_raw)
     return _cached_broker_result(
-        f"option_greeks_{underlying}_{expiry_raw}",
+        f"option_greeks_{str(exchange).upper()}_{underlying}_{expiry_raw}",
         OPTION_GREEKS_TTL_SECONDS,
         lambda: fetch_option_greeks(smart_api, underlying, expiry_raw),
     )
 
 
-def get_option_candles_for_ui(smart_api, contract):
+def get_option_candles_for_ui(smart_api, contract, interval="FIVE_MINUTE"):
     if smart_api is None:
-        return fetch_option_candles(None, contract)
+        return fetch_option_candles(None, contract, interval=interval)
+    contract_identity = fo_contract_key(contract)
     return _cached_broker_result(
-        f"option_candles_{contract['token']}",
+        f"option_candles_{contract_identity}_{interval}",
         OPTION_CHART_TTL_SECONDS,
-        lambda: fetch_option_candles(smart_api, contract),
+        lambda: fetch_option_candles(smart_api, contract, interval=interval),
     )
+
+
+def get_fo_chain_for_ui(smart_api, index_name, expiry_raw, chain_contracts):
+    """Cache a small, exchange-aware batch quote snapshot for the visible chain."""
+    ordered_keys = sorted(fo_contract_key(contract) for contract in chain_contracts or [])
+    identity = hashlib.sha256("|".join(ordered_keys).encode("utf-8")).hexdigest()[:20]
+    cache_key = f"fo5_chain_{str(index_name)}_{str(expiry_raw)}_{identity}"
+    if smart_api is None:
+        return fetch_broker_market_data(None, chain_contracts)
+    return _cached_broker_result(
+        cache_key,
+        OPTION_CHAIN_TTL_SECONDS,
+        lambda: fetch_broker_market_data(smart_api, chain_contracts),
+    )
+
+
+def clear_selected_option_broker_cache(contract, underlying, expiry_raw, interval, exchange="NFO"):
+    """Clear only the current selected contract's short-lived broker snapshots."""
+    identity = fo_contract_key(contract)
+    if identity and not identity.endswith(":"):
+        st.session_state.pop(f"option_snapshot_{identity}", None)
+        st.session_state.pop(f"option_candles_{identity}_{interval}", None)
+    st.session_state.pop(f"option_greeks_{str(exchange).upper()}_{underlying}_{expiry_raw}", None)
 
 
 def broker_snapshot_caption(result):
     if not result.get("ok"):
         return result.get("message", "Broker data is unavailable.")
     age = result.get("age_seconds", 0.0)
-    fetched_at = datetime.fromtimestamp(result.get("fetched_at", time.time())).strftime("%H:%M:%S")
+    fetched_at = datetime.fromtimestamp(result.get("fetched_at", time.time()), IST_TIMEZONE).strftime("%H:%M:%S")
     status = "STALE" if age > OPTION_SNAPSHOT_TTL_SECONDS else "BROKER SNAPSHOT"
     return f"{status} · fetched {fetched_at} IST · age {age:.0f}s · {result.get('source', 'Angel One')}"
+
+
+def broker_chain_caption(result):
+    """Describe chain completeness/freshness without calling partial data live."""
+    snapshot = result if isinstance(result, dict) else {}
+    if not snapshot.get("ok"):
+        return snapshot.get("message", "Broker option-chain data is unavailable.")
+    requested = _as_int(snapshot.get("requested_count")) or 0
+    fetched = _as_int(snapshot.get("fetched_count")) or 0
+    age = _as_float(snapshot.get("age_seconds")) or 0.0
+    fetched_at = datetime.fromtimestamp(snapshot.get("fetched_at", time.time()), IST_TIMEZONE).strftime("%H:%M:%S")
+    state = "CHAIN LIVE" if snapshot.get("state") == "snapshot" and age <= OPTION_CHAIN_TTL_SECONDS else "CHAIN PARTIAL" if snapshot.get("state") == "partial" else "CHAIN STALE"
+    return f"{state} · {fetched}/{requested} contracts · fetched {fetched_at} IST · age {age:.0f}s · {snapshot.get('source', 'Angel One')}"
+
+def _fo_widget_suffix(contract):
+    """Use a stable, safe widget suffix tied to exchange + broker token."""
+    identity = fo_contract_key(contract)
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16] if identity else "unselected"
+
+
+def _fo_quote_change(snapshot, chain_quote):
+    """Prefer SmartAPI's percentage; otherwise derive it from two actual quote fields."""
+    quote = chain_quote if isinstance(chain_quote, dict) else {}
+    reported = _as_float(quote.get("percent_change"))
+    if reported is not None:
+        return reported
+    ltp = _as_float((snapshot or {}).get("ltp"))
+    close = _as_float((snapshot or {}).get("close"))
+    if ltp is not None and close is not None and close > 0:
+        return (ltp - close) / close * 100.0
+    return None
+
+
+def _format_fo_chain_rows(rows):
+    """Format missing broker fields as a visible dash rather than a zero."""
+    formatted = []
+    for raw in rows or []:
+        row = dict(raw)
+        for label in ("CE LTP", "CE Bid", "CE Ask", "PE LTP", "PE Bid", "PE Ask", "Strike"):
+            row[label] = _fo_currency(row.get(label))
+        for label in ("CE Chg%", "PE Chg%"):
+            row[label] = _fo_percent(row.get(label))
+        for label in ("CE Volume", "CE OI", "PE Volume", "PE OI"):
+            value = _as_float(row.get(label))
+            row[label] = "—" if value is None else f"{value:,.0f}"
+        formatted.append(row)
+    return formatted
+
+
+def _fo_candle_figure(candles, title, height=430):
+    """Build one dark TradingView-like candlestick chart from real chart rows."""
+    frame = candles.copy() if isinstance(candles, pd.DataFrame) else pd.DataFrame()
+    required = {"Open", "High", "Low", "Close"}
+    if frame.empty or not required.issubset(frame.columns):
+        return None
+    x_values = frame["time"] if "time" in frame.columns else frame.index
+    close = pd.to_numeric(frame["Close"], errors="coerce")
+    figure = go.Figure(go.Candlestick(
+        x=x_values,
+        open=frame["Open"], high=frame["High"], low=frame["Low"], close=close,
+        name=title, increasing_line_color="#34d399", decreasing_line_color="#fb7185",
+    ))
+    if len(frame) >= 9:
+        figure.add_trace(go.Scatter(
+            x=x_values, y=close.ewm(span=9, adjust=False).mean(), mode="lines",
+            name="EMA 9", line=dict(color="#22d3ee", width=1.25),
+        ))
+    if len(frame) >= 20:
+        figure.add_trace(go.Scatter(
+            x=x_values, y=close.ewm(span=20, adjust=False).mean(), mode="lines",
+            name="EMA 20", line=dict(color="#a78bfa", width=1.25),
+        ))
+    if "Volume" in frame.columns:
+        volume = pd.to_numeric(frame["Volume"], errors="coerce").fillna(0)
+        if volume.gt(0).any():
+            typical = (pd.to_numeric(frame["High"], errors="coerce") + pd.to_numeric(frame["Low"], errors="coerce") + close) / 3.0
+            cumulative_volume = volume.cumsum().replace(0, np.nan)
+            vwap = (typical * volume).cumsum() / cumulative_volume
+            if vwap.notna().any():
+                figure.add_trace(go.Scatter(
+                    x=x_values, y=vwap, mode="lines", name="Session VWAP",
+                    line=dict(color="#fbbf24", width=1.2, dash="dot"),
+                ))
+    figure = apply_chart_style(figure, height=height)
+    figure.update_layout(title=dict(text=title, font=dict(size=13, color="#e2e8f0")))
+    figure.update_xaxes(rangeslider_visible=False)
+    return figure
+
+
+def _render_fo_gate(gate):
+    """Render the consistent F&O gate without trusting values as HTML."""
+    safe_gate = {key: html.escape(str(value)) for key, value in (gate or {}).items()}
+    st.markdown(
+        """
+        <div class="fo-trade-gate {tone}">
+          <div class="fo-gate-heading">
+            <span>🛡️ F&amp;O TRADE GATE</span>
+            <span class="fo-gate-decision">{decision_note}</span>
+          </div>
+          <div class="fo-gate-grid">
+            <div class="fo-gate-stat"><div class="fo-gate-label">Decision</div><div class="fo-gate-value">{decision}</div></div>
+            <div class="fo-gate-stat"><div class="fo-gate-label">Conditions</div><div class="fo-gate-value">{conditions}</div><div class="fo-gate-note">{condition_detail}</div></div>
+            <div class="fo-gate-stat"><div class="fo-gate-label">Risk status</div><div class="fo-gate-value">{risk_status}</div><div class="fo-gate-note">Broker-selected contract only</div></div>
+          </div>
+          <div class="fo-gate-message">{message}</div>
+        </div>
+        """.format(**safe_gate),
+        unsafe_allow_html=True,
+    )
+
+
+def _render_fo_risk_controls(selected_contract, option_snapshot, gate, is_paper_trading, live_orders_armed, broker_client):
+    """Render a directional planning calculator and deliberately gated order actions."""
+    if not option_snapshot.get("ok") or not gate.get("allow_risk_preview"):
+        st.info("A fresh selected-contract broker LTP is required before risk planning can be shown. No premium is estimated.")
+        return
+    suffix = _fo_widget_suffix(selected_contract)
+    minimum_step = _as_float(selected_contract.get("tick_size")) or 0.05
+    st.markdown("<div class='bottom-card'><div class='bottom-title'>💰 Selected Option Intraday Risk Preview</div><div style='font-size:11px;color:#94a3b8;'>The switch below changes entry, stop, target, and illustrative P&amp;L direction. It does not send an order.</div></div>", unsafe_allow_html=True)
+    risk_1, risk_2 = st.columns(2)
+    with risk_1:
+        lots = st.number_input("Lots", min_value=1, value=1, step=1, key=f"fo5_lots_{suffix}")
+    with risk_2:
+        option_action = st.radio("Premium action", ["BUY", "SELL"], horizontal=True, key=f"fo5_action_{suffix}")
+    risk_3, risk_4 = st.columns(2)
+    with risk_3:
+        default_stop = max(minimum_step, round(float(option_snapshot["ltp"]) * 0.15, 2))
+        option_stop = st.number_input("Risk points (₹)", min_value=float(minimum_step), value=float(default_stop), step=float(minimum_step), key=f"fo5_stop_{suffix}")
+    with risk_4:
+        option_target = st.number_input("Target points (₹)", min_value=float(minimum_step), value=float(round(option_stop * 3, 2)), step=float(minimum_step), key=f"fo5_target_{suffix}")
+    option_quantity = int(lots) * int(selected_contract["lot_size"])
+    try:
+        preview = calculate_directional_preview(option_action, option_snapshot["ltp"], option_stop, option_target, option_quantity)
+    except ValueError as exc:
+        st.error(f"Option sizing needs valid values: {exc}")
+        return
+    premium_label = "Premium outlay before charges" if option_action == "BUY" else "Gross premium received — broker margin is not calculated"
+    st.markdown(
+        f"<div class='calc-box'><div class='calc-row'><span style='color:#94a3b8;'>Quantity:</span><strong>{int(lots)} lot × {selected_contract['lot_size']} = {option_quantity}</strong></div><div class='calc-row'><span style='color:#94a3b8;'>{premium_label}:</span><strong style='color:#00f2fe;'>₹{preview['gross_notional']:,.2f}</strong></div><div class='calc-row'><span style='color:#94a3b8;'>{option_action} entry / stop / target:</span><strong>₹{preview['entry_price']:.2f} / <span style='color:#fb7185'>₹{preview['stop_price']:.2f}</span> / <span style='color:#34d399'>₹{preview['target_price']:.2f}</span></strong></div><div class='calc-row'><span style='color:#94a3b8;'>Illustrative P&amp;L target / stop:</span><strong><span style='color:#34d399'>+₹{preview['target_pnl']:,.2f}</span> / <span style='color:#fb7185'>₹{preview['loss_pnl']:,.2f}</span></strong></div></div>",
+        unsafe_allow_html=True,
+    )
+    buy_locked = option_action == "BUY" and not gate.get("allow_long_entry")
+    if buy_locked:
+        st.warning(f"BUY is locked by the F&O Trade Gate: {gate.get('decision', 'WAIT / NEUTRAL')}. These are planning values only.")
+    if is_paper_trading:
+        button_key = f"mkt_buy_fo5_{suffix}" if option_action == "BUY" else f"mkt_sell_fo5_{suffix}"
+        if st.button(f"{'🟢' if option_action == 'BUY' else '🔴'} 📝 Log {option_action} paper position", width="stretch", key=button_key, disabled=buy_locked):
+            ok, message = place_paper_order(
+                selected_contract["symbol"], option_action, option_quantity,
+                option_snapshot["ltp"], option_stop, option_target,
+            )
+            (st.success if ok else st.error)(f"{'✅' if ok else '❌'} {message}")
+        if option_action == "SELL":
+            st.caption("Paper SELL is a simulation of a short option. It is never enabled for live submission in this desk.")
+        return
+    if option_action == "SELL":
+        st.warning("Live short-option submission is unavailable until an actual broker margin and product preflight is implemented. Gross premium is not treated as available capital.")
+        return
+    if not gate.get("allow_long_entry"):
+        st.markdown(f"<div class='live-arm-card'>🔒 <strong>LIVE BUY LOCKED BY F&amp;O TRADE GATE</strong> — {html.escape(str(gate.get('decision', 'WAIT / NEUTRAL')))}. Wait for current broker evidence.</div>", unsafe_allow_html=True)
+        return
+    if live_orders_armed:
+        st.markdown("<div class='live-ready-card'>⚡ <strong>LIVE LONG-OPTION MARKET MODE</strong> — final broker acceptance is still required. Displayed SL/target are planning values, not broker-attached exits.</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div class='live-arm-card'>🔒 <strong>LIVE MODE NOT ARMED</strong> — connect and arm Angel One below.</div>", unsafe_allow_html=True)
+    confirmation_key = f"fo5_confirm_buy_{suffix}_{option_quantity}"
+    confirmed = st.checkbox(
+        f"I understand: submit LIVE MARKET BUY {selected_contract['symbol']} ({option_quantity} qty) as INTRADAY after a fresh broker quote.",
+        key=confirmation_key,
+        disabled=not live_orders_armed,
+    )
+    if st.button(f"🟢 ⚡ LIVE BUY MARKET {selected_contract['symbol']}", width="stretch", key=f"live_option_buy_fo5_{suffix}", disabled=not (live_orders_armed and confirmed)):
+        with st.spinner("Refreshing broker premium and submitting your confirmed intraday order..."):
+            fresh_snapshot = fetch_selected_option_snapshot(broker_client, selected_contract)
+            if fresh_snapshot.get("ok"):
+                success, message, details = place_regular_order(broker_client, selected_contract, option_quantity, "BUY", "INTRADAY")
+            else:
+                success, message, details = False, f"Fresh broker LTP is required: {fresh_snapshot.get('message', 'unavailable')}", None
+        if success:
+            order_id = details.get("order_id") if isinstance(details, dict) else ""
+            st.session_state["last_live_submission"] = {
+                "symbol": selected_contract["symbol"], "action": "BUY", "kind": "F&O INTRADAY MARKET",
+                "order_id": order_id, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            st.success(f"✅ LIVE F&O order submitted to Angel One{f' · Order ID: {order_id}' if order_id else ''}. Verify final status in the broker order book.")
+        else:
+            st.error(f"Live F&O order was not submitted: {message}")
+
+
+def build_fo_compact_index_overview(chart_timeframe):
+    """Return a five-index public-context table without inventing broker values."""
+    period, interval = FO_PUBLIC_CHART_OPTIONS[chart_timeframe]
+    frames = {}
+    errors = {}
+    for index_name, spec in FO_INDEX_UNIVERSE.items():
+        frame, error = fetch_fo_public_index_chart(spec["chart_symbol"], period, interval)
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            frames[spec["chart_symbol"]] = frame
+        if error:
+            errors[index_name] = error
+    batch = pd.concat(frames, axis=1, sort=False) if frames else pd.DataFrame()
+    symbols = [spec["chart_symbol"] for spec in FO_INDEX_UNIVERSE.values()]
+    results, checklists, _ = evaluate_equity_intelligence_scan(symbols, batch, pd.DataFrame(), 3)
+    result_by_symbol = {str(row.get("Symbol")): row for _, row in results.iterrows()} if not results.empty else {}
+    rows = []
+    for index_name, spec in FO_INDEX_UNIVERSE.items():
+        result = result_by_symbol.get(spec["chart_symbol"], {})
+        price = _as_float(result.get("Price")) if hasattr(result, "get") else None
+        change = _as_float(result.get("Chg%")) if hasattr(result, "get") else None
+        buy_text = str(result.get("Buy") or "") if hasattr(result, "get") else ""
+        sell_text = str(result.get("Sell") or "") if hasattr(result, "get") else ""
+        buy = _as_int(buy_text.split("/", 1)[0])
+        sell = _as_int(sell_text.split("/", 1)[0])
+        trend = str(result.get("Trend") or "DATA REQUIRED") if hasattr(result, "get") else "DATA REQUIRED"
+        if trend == "BULLISH":
+            bias = "BULLISH · CE CONTEXT"
+        elif trend == "BEARISH":
+            bias = "BEARISH · PE CONTEXT"
+        elif trend == "SIDEWAYS / NO TRADE":
+            bias = "NEUTRAL / NO TRADE"
+        else:
+            bias = "DATA REQUIRED"
+        rows.append({
+            "Contract": index_name,
+            "Underlying LTP": price,
+            "Chg%": change,
+            "Score": f"{buy or 0}/10 Buy · {sell or 0}/10 Sell" if price is not None else "— / 10",
+            "Technical Bias": bias,
+            "Data note": "PUBLIC CONTEXT · MAY BE DELAYED" if price is not None else f"DATA UNAVAILABLE · {errors.get(index_name, 'No usable public chart')}",
+        })
+    return pd.DataFrame(rows), checklists, frames
+
+
+def render_fo_index_desk(is_paper_trading, live_orders_armed, compact=False):
+    """Render the focused five-index F&O desk with source-safe data states."""
+    st.markdown(
+        """
+        <div class="disclaimer-banner"><strong>F&amp;O Index Desk</strong> — NIFTY 50, BANKNIFTY, FINNIFTY, SENSEX, and NIFT Midcap only. Select CE/PE and strike yourself. Chain prices, depth, volume, and OI appear only from Angel One; the public index chart is labelled context-only and cannot unlock a trade.</div>
+        """,
+        unsafe_allow_html=True,
+    )
+    first_index = next(iter(FO_INDEX_UNIVERSE))
+    if st.session_state.get("fo5_index") not in FO_INDEX_UNIVERSE:
+        st.session_state["fo5_index"] = first_index
+    if compact:
+        compact_top, compact_refresh = st.columns([7.5, 2.5])
+        with compact_top:
+            chart_timeframe = st.selectbox("Underlying context timeframe", list(FO_PUBLIC_CHART_OPTIONS.keys()), key="fo_compact_public_timeframe")
+        with compact_refresh:
+            st.write("")
+            if st.button("↻ Refresh F&O context", width="stretch", key="refresh_fo_compact"):
+                clear_all_short_lived_broker_cache()
+                clear_chart = getattr(fetch_fo_public_index_chart, "clear", None)
+                if callable(clear_chart):
+                    clear_chart()
+                st.rerun()
+        overview, _, _ = build_fo_compact_index_overview(chart_timeframe)
+        grid = st.dataframe(
+            overview, width="stretch", hide_index=True, height=250, on_select="rerun",
+            selection_mode="single-row", key="fo_compact_index_table",
+            column_config={
+                "Underlying LTP": st.column_config.NumberColumn(format="₹%.2f"),
+                "Chg%": st.column_config.NumberColumn(format="%.2f%%"),
+            },
+        )
+        selected_rows = (grid.selection or {}).get("rows", [])
+        if selected_rows:
+            selected_name = str(overview.iloc[selected_rows[0]]["Contract"])
+            if selected_name in FO_INDEX_UNIVERSE:
+                st.session_state["fo5_index"] = selected_name
+        st.caption("Select a row to inspect it below. This table is public underlying context only; option prices, chain fields, Greeks and order planning remain Angel One broker data only.")
+    else:
+        index_columns = st.columns(len(FO_INDEX_UNIVERSE))
+        for column, index_name in zip(index_columns, FO_INDEX_UNIVERSE):
+            with column:
+                active = st.session_state["fo5_index"] == index_name
+                if st.button(
+                    f"{'● ' if active else ''}{index_name}",
+                    width="stretch", type="primary" if active else "secondary", key=f"fo_index_{index_name}",
+                ) and not active:
+                    st.session_state["fo5_index"] = index_name
+                    st.rerun()
+    selected_index = st.session_state["fo5_index"]
+    spec = FO_INDEX_UNIVERSE[selected_index]
+    st.caption(f"{spec['description']} · options exchange: {spec['option_exchange']} · index quote exchange: {spec['spot_exchange']} · no stock or unverified derivative contracts are included.")
+
+    controls_1, controls_2, controls_3, controls_4 = st.columns([2.2, 2.2, 2.0, 2.6])
+    with controls_1:
+        fo_interval_label = st.selectbox("Broker intraday candles", list(FO_INTERVAL_OPTIONS.keys()), key="fo5_interval")
+        fo_interval = FO_INTERVAL_OPTIONS[fo_interval_label]
+    with controls_2:
+        if compact:
+            st.caption(f"Public context: {chart_timeframe}. Broker candles are used for the trade gate.")
+        else:
+            chart_timeframe = st.selectbox("Underlying chart timeframe", list(FO_PUBLIC_CHART_OPTIONS.keys()), key="fo5_public_timeframe")
+    with controls_3:
+        band_label = st.radio("Chain range", ["ATM ±5 strikes", "ATM ±10 strikes"], horizontal=False, key="fo5_band")
+        chain_depth = 5 if band_label == "ATM ±5 strikes" else 10
+    with controls_4:
+        st.write("")
+        if st.button("↻ Refresh Angel One master + F&O data", width="stretch", key="refresh_fo5_master"):
+            load_angel_option_master.clear()
+            clear_all_short_lived_broker_cache()
+            clear_chart = getattr(fetch_fo_public_index_chart, "clear", None)
+            if callable(clear_chart):
+                clear_chart()
+            st.rerun()
+
+    master_rows, master_error = load_angel_option_master()
+    if master_error:
+        st.error(f"Angel One instrument master is unavailable: {master_error}")
+        st.caption("No contracts, strikes, option prices, OI, Greeks, or lot sizes are substituted while the master is unavailable. You can still use the broker gateway below.")
+        return
+    index_contracts = resolve_fo_index_option_contracts(master_rows, selected_index)
+    spot_contract = resolve_fo_index_spot_contract(master_rows, selected_index)
+    if not index_contracts:
+        st.warning(f"Angel One's current master has no non-expired {spec['option_exchange']} OPTIDX contracts for {selected_index}. No fallback contract is used.")
+        return
+    if spot_contract is None:
+        st.warning(f"Angel One's current master has no {spec['spot_exchange']} AMXIDX record for {selected_index}. A public chart can be shown, but broker ATM and the F&O trade gate stay unavailable.")
+
+    expiry_values = list(dict.fromkeys(contract["expiry_raw"] for contract in index_contracts))
+    expiry_labels = {contract["expiry_raw"]: contract["expiry_label"] for contract in index_contracts}
+    selected_expiry = st.selectbox(
+        "Expiry", expiry_values, format_func=lambda value: expiry_labels[value],
+        key=f"fo5_expiry_{selected_index}",
+    )
+    expiry_contracts = [contract for contract in index_contracts if contract["expiry_raw"] == selected_expiry]
+    chain_pairs_by_strike = pair_fo_index_contracts(expiry_contracts)
+    if not chain_pairs_by_strike:
+        st.warning("The selected expiry has no valid CE/PE pairs in the Angel One master.")
+        return
+
+    broker_client = st.session_state.get("smart_api")
+    underlying_snapshot = get_option_snapshot_for_ui(broker_client, spot_contract) if spot_contract else {
+        "ok": False, "state": "unavailable", "message": "No broker index contract was resolved from the master.",
+    }
+    broker_atm_strike = nearest_fo_chain_strike(chain_pairs_by_strike, underlying_snapshot.get("ltp"))
+    all_strikes = sorted(chain_pairs_by_strike)
+    manual_default = broker_atm_strike if broker_atm_strike in all_strikes else all_strikes[len(all_strikes) // 2]
+    centre_key = f"fo5_centre_{selected_index}_{selected_expiry}"
+    if st.session_state.get(centre_key) not in all_strikes:
+        st.session_state.pop(centre_key, None)
+    selection_1, selection_2, selection_3, selection_4 = st.columns([2.5, 2.2, 2.3, 3.0])
+    with selection_1:
+        center_strike = st.selectbox(
+            "Chain centre strike", all_strikes, index=all_strikes.index(manual_default),
+            format_func=lambda value: f"₹{value:,.2f}", key=centre_key,
+        )
+        if broker_atm_strike is not None:
+            st.caption(f"Broker ATM nearest listed strike: ₹{broker_atm_strike:,.2f}")
+        else:
+            st.caption("Broker index LTP unavailable — this is a manual centre, not an ATM claim.")
+    chain_pairs = fo_chain_band(chain_pairs_by_strike, center_strike, chain_depth)
+    available_sides = [side for side in ("CE", "PE") if any(pair.get(side) for pair in chain_pairs)]
+    side_key = f"fo5_side_{selected_index}_{selected_expiry}"
+    if st.session_state.get(side_key) not in available_sides:
+        st.session_state.pop(side_key, None)
+    with selection_2:
+        selected_side = st.radio(
+            "Option side", available_sides,
+            format_func=lambda side: "CALL (CE)" if side == "CE" else "PUT (PE)",
+            horizontal=True, key=side_key,
+            help="Choose the CE or PE deliberately. The app never flips side automatically from an underlying signal.",
+        )
+    available_strikes = [pair["strike"] for pair in chain_pairs if pair.get(selected_side)]
+    strike_key = f"fo5_strike_{selected_index}_{selected_expiry}_{selected_side}"
+    if st.session_state.get(strike_key) not in available_strikes:
+        st.session_state.pop(strike_key, None)
+    selected_default = broker_atm_strike if broker_atm_strike in available_strikes else available_strikes[0]
+    with selection_3:
+        selected_strike = st.selectbox(
+            "Selected strike", available_strikes, index=available_strikes.index(selected_default),
+            format_func=lambda value: f"₹{value:,.2f}", key=strike_key,
+        )
+    selected_contract = next(pair[selected_side] for pair in chain_pairs if pair["strike"] == selected_strike and pair.get(selected_side))
+    with selection_4:
+        st.write("")
+        if st.button("↻ Refresh selected chain + contract", width="stretch", key=f"refresh_fo5_selected_{_fo_widget_suffix(selected_contract)}_{fo_interval}"):
+            clear_all_short_lived_broker_cache()
+            clear_selected_option_broker_cache(selected_contract, selected_contract["underlying"], selected_expiry, fo_interval, selected_contract["exchange"])
+            st.rerun()
+
+    chain_contracts = [contract for pair in chain_pairs for contract in (pair.get("CE"), pair.get("PE")) if contract]
+    chain_snapshot = get_fo_chain_for_ui(broker_client, selected_index, selected_expiry, chain_contracts)
+    selected_snapshot = get_option_snapshot_for_ui(broker_client, selected_contract)
+    option_candle_snapshot = get_option_candles_for_ui(broker_client, selected_contract, fo_interval)
+    option_candles = normalise_broker_option_candles(option_candle_snapshot.get("candles", [])) if option_candle_snapshot.get("ok") else pd.DataFrame()
+    option_evidence = evaluate_intraday_option_evidence(option_candles, instrument_label="Selected option premium")
+    option_gate = build_fo_trade_gate(selected_snapshot, option_candle_snapshot, option_evidence)
+    underlying_candle_snapshot = get_option_candles_for_ui(broker_client, spot_contract, fo_interval) if spot_contract else {
+        "ok": False, "state": "unavailable", "message": "No broker index contract was resolved from the master.", "candles": [],
+    }
+    underlying_candles = normalise_broker_option_candles(underlying_candle_snapshot.get("candles", [])) if underlying_candle_snapshot.get("ok") else pd.DataFrame()
+    underlying_evidence = evaluate_intraday_option_evidence(underlying_candles, instrument_label="Underlying index")
+    composite_gate = build_fo_composite_gate(
+        underlying_snapshot, underlying_evidence, selected_contract, option_gate, option_evidence,
+    )
+    if spec["option_exchange"] == "NFO":
+        greeks_snapshot = get_option_greeks_for_ui(
+            broker_client, selected_contract["underlying"], selected_expiry, selected_contract["exchange"],
+        )
+        selected_greeks = selected_contract_greeks(greeks_snapshot.get("rows", []), selected_contract) if greeks_snapshot.get("ok") else {}
+    else:
+        greeks_snapshot = {"ok": False, "state": "unavailable", "message": "BFO/SENSEX Greeks are not requested because this SmartAPI endpoint is not verified for BFO.", "rows": []}
+        selected_greeks = {}
+    public_period, public_interval = FO_PUBLIC_CHART_OPTIONS[chart_timeframe]
+    public_chart, public_chart_error = fetch_fo_public_index_chart(spec["chart_symbol"], public_period, public_interval)
+    selected_chain_quote = quote_for_fo_contract(chain_snapshot, selected_contract)
+
+    main_left, main_right = st.columns([6.4, 3.6])
+    with main_left:
+        st.markdown(f"<div class='bottom-card'><div class='bottom-title'>📈 {html.escape(selected_index)} underlying chart</div><div style='font-size:11px;color:#94a3b8;'>Broker chart is preferred for the current session. Public chart is a delayed context fallback only; it never unlocks the trade gate.</div></div>", unsafe_allow_html=True)
+        index_metric_1, index_metric_2, index_metric_3 = st.columns(3)
+        with index_metric_1:
+            st.metric("Broker index LTP", _fo_currency(underlying_snapshot.get("ltp")))
+        with index_metric_2:
+            st.metric("Broker state", "LIVE" if underlying_snapshot.get("ok") else "UNAVAILABLE")
+        with index_metric_3:
+            st.metric("Underlying gate", underlying_evidence.get("summary", {}).get("regime", "INSUFFICIENT_DATA"))
+        chart_frame = underlying_candles if not underlying_candles.empty else public_chart
+        chart_source = "Angel One current-session broker candles" if not underlying_candles.empty else f"Public delayed context · {spec['chart_symbol']}"
+        figure = _fo_candle_figure(chart_frame, f"{selected_index} · {chart_source}")
+        if figure is not None:
+            st.plotly_chart(figure, width="stretch", theme=None, config={"scrollZoom": True, "displaylogo": False}, key=f"fo5_underlying_chart_{selected_index}_{chart_timeframe}_{fo_interval}")
+            if not underlying_candles.empty:
+                st.caption(broker_snapshot_caption(underlying_candle_snapshot) + " · current IST session only")
+            else:
+                st.caption(f"{chart_source}. {public_chart_error or 'May be delayed; not used for ATM or an entry decision.'}")
+        else:
+            st.info(f"Underlying chart unavailable. {public_chart_error or underlying_candle_snapshot.get('message', 'No usable chart rows were returned.')}")
+    with main_right:
+        option_change = _fo_quote_change(selected_snapshot, selected_chain_quote)
+        premium_text = _fo_currency(selected_snapshot.get("ltp")) if selected_snapshot.get("ok") else "Unavailable"
+        premium_color = "#34d399" if selected_snapshot.get("ok") else "#fbbf24"
+        option_side_label = "CALL (CE)" if selected_contract["side"] == "CE" else "PUT (PE)"
+        quote_volume = _as_float(selected_chain_quote.get("volume"))
+        quote_oi = _as_float(selected_chain_quote.get("open_interest"))
+        volume_text = "—" if quote_volume is None else f"{quote_volume:,.0f}"
+        oi_text = "—" if quote_oi is None else f"{quote_oi:,.0f}"
+        st.markdown(
+            f"""
+            <div class="inspector-card">
+              <div style="display:flex;justify-content:space-between;gap:9px;align-items:flex-start;">
+                <div><div style="font-size:18px;font-weight:800;color:#fff;font-family:'JetBrains Mono',monospace;word-break:break-word;">{html.escape(selected_contract['symbol'])}</div><div style="font-size:25px;font-weight:800;color:{premium_color};margin:4px 0;">{premium_text}</div></div>
+                <span style="background:rgba(0,242,254,.12);border:1px solid rgba(0,242,254,.3);color:#67e8f9;font-size:10px;padding:4px 7px;border-radius:6px;font-weight:800;">{html.escape(option_setup_from_evidence(option_evidence))}</span>
+              </div>
+              <div style="display:flex;justify-content:space-between;gap:7px;flex-wrap:wrap;font-size:11px;margin:10px 0;padding:8px 10px;background:rgba(30,41,59,.6);border-radius:6px;"><span>{option_side_label}</span><span>Strike <strong>₹{selected_contract['strike']:,.2f}</strong></span><span>Lot <strong>{selected_contract['lot_size']}</strong></span><span>Tick <strong>{_fo_currency(selected_contract.get('tick_size'))}</strong></span></div>
+              <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;font-size:11px;"><span>LTP change <strong>{_fo_percent(option_change)}</strong></span><span>Bid / Ask <strong>{_fo_currency(selected_chain_quote.get('bid'))} / {_fo_currency(selected_chain_quote.get('ask'))}</strong></span><span>Volume <strong>{volume_text}</strong></span><span>OI <strong>{oi_text}</strong></span></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if selected_snapshot.get("ok"):
+            st.caption(broker_snapshot_caption(selected_snapshot))
+        elif selected_snapshot.get("state") == "disconnected":
+            st.warning("Connect Angel One below to load this selected CE/PE's real LTP, broker chart, and data fields. No premium is estimated.")
+        else:
+            st.error(f"Selected-contract LTP unavailable: {selected_snapshot.get('message', 'Unknown broker error.')}")
+        _render_fo_gate(composite_gate)
+        if selected_greeks:
+            st.caption("Broker-reported only: " + " · ".join(f"{label}: {value}" for label, value in selected_greeks.items()) + " · " + broker_snapshot_caption(greeks_snapshot))
+        elif greeks_snapshot.get("state") == "unavailable":
+            st.caption(f"Greeks/IV: {greeks_snapshot.get('message', 'Not returned by the broker.')}")
+        elif broker_client is not None:
+            st.caption(f"Greeks/IV unavailable: {greeks_snapshot.get('message', 'No broker response.')}")
+
+    st.markdown("<div class='bottom-card' style='margin-top:12px;'><div class='bottom-title'>🧾 Broker option chain around selected centre</div><div style='font-size:11px;color:#94a3b8;'>LTP, change, bid/ask, volume and OI are direct SmartAPI FULL-market fields where returned. OI change, PCR, IV, and Greeks are not inferred.</div></div>", unsafe_allow_html=True)
+    if chain_snapshot.get("ok"):
+        st.caption(broker_chain_caption(chain_snapshot))
+    elif chain_snapshot.get("state") == "disconnected":
+        st.warning("Angel One is disconnected. The table still shows verified contract identities, but every market field remains unavailable.")
+    else:
+        st.warning(f"Chain quote snapshot unavailable: {chain_snapshot.get('message', 'Unknown broker error.')}")
+    chain_rows = _format_fo_chain_rows(build_fo_chain_rows(chain_pairs, chain_snapshot, selected_contract))
+    st.dataframe(pd.DataFrame(chain_rows), width="stretch", hide_index=True, height=420, key=f"fo5_chain_table_{selected_index}_{selected_expiry}_{center_strike}_{chain_depth}")
+
+    bottom_left, bottom_right = st.columns([6.0, 4.0])
+    with bottom_left:
+        st.markdown("<div class='bottom-card'><div class='bottom-title'>📉 Selected CE/PE premium chart and conditions</div><div style='font-size:11px;color:#94a3b8;'>This chart and its ten checks use only the selected contract's current-session broker candles.</div></div>", unsafe_allow_html=True)
+        option_figure = _fo_candle_figure(option_candles, f"{selected_contract['symbol']} · Angel One current session")
+        if option_figure is not None:
+            st.plotly_chart(option_figure, width="stretch", theme=None, config={"scrollZoom": True, "displaylogo": False}, key=f"fo5_option_chart_{_fo_widget_suffix(selected_contract)}_{fo_interval}")
+            st.caption(broker_snapshot_caption(option_candle_snapshot) + " · current IST session only")
+        else:
+            st.info(f"Selected premium chart unavailable: {option_candle_snapshot.get('message', 'At least one current-session broker candle is required.')}")
+        if option_evidence.get("message"):
+            st.caption(option_evidence["message"])
+        else:
+            st.markdown(evidence_items_html(option_evidence.get("checks", [])), unsafe_allow_html=True)
+    with bottom_right:
+        _render_fo_risk_controls(selected_contract, selected_snapshot, composite_gate, is_paper_trading, live_orders_armed, broker_client)
+        st.caption("SELL calculations reverse price direction correctly, but live short-option submission remains deliberately unavailable until it has a broker margin/product preflight.")
+
+    with st.expander("🔎 What is verified for this F&O view", expanded=False):
+        verification_rows = build_fo_verification_rows(
+            selected_contract, selected_snapshot, option_candle_snapshot, option_evidence, selected_greeks,
+        )
+        verification_rows.insert(0, {
+            "Field": "Underlying direction", "Value": underlying_evidence.get("summary", {}).get("regime", "INSUFFICIENT_DATA"),
+            "Source / status": "Angel One broker index candles only; public chart is context-only",
+        })
+        verification_rows.insert(1, {
+            "Field": "Option chain", "Value": f"{chain_snapshot.get('fetched_count', 0)}/{chain_snapshot.get('requested_count', 0)} quotes",
+            "Source / status": broker_chain_caption(chain_snapshot),
+        })
+        st.dataframe(pd.DataFrame(verification_rows), width="stretch", hide_index=True, key=f"fo5_verification_{_fo_widget_suffix(selected_contract)}_{fo_interval}")
+
 
 def live_order_is_armed():
     return bool(
@@ -1319,8 +3564,12 @@ def place_regular_order(smart_api, contract, qty, action, product_type="INTRADAY
     return submit_live_order(smart_api, params)
 
 
-def submit_live_equity_from_ui(smart_api, clean_symbol, chart_symbol, quantity, action, order_mode, limit_price, stoploss_points, target_points, product_type):
+def submit_live_equity_from_ui(smart_api, clean_symbol, chart_symbol, quantity, action, order_mode, limit_price, stoploss_points, target_points, product_type, horizon=None):
     """Resolve, quote-check, and submit a confirmed cash-equity order."""
+    if horizon is not None:
+        policy_ok, policy_message = validate_equity_trade_policy(horizon, action, order_mode, product_type)
+        if not policy_ok:
+            return False, policy_message, None, None
     contract, contract_error = resolve_angel_equity_contract(clean_symbol, chart_symbol)
     if contract_error:
         return False, contract_error, None, None
@@ -1358,10 +3607,9 @@ FALLBACK_INDEX_BASKETS = {
         "INDUSINDBK.NS", "BANKBARODA.NS", "PNB.NS", "AUBANK.NS", "FEDERALBNK.NS",
         "BANDHANBNK.NS", "IDFCFIRSTB.NS"
     ],
-    "SENSEX watchlist (bundled)": [
-        "RELIANCE.BO", "TCS.BO", "HDFCBANK.BO", "ICICIBANK.BO", "BHARTIARTL.BO",
-        "SBIN.BO", "INFY.BO", "ITC.BO", "LT.BO", "HINDUNILVR.BO", "AXISBANK.BO"
-    ],
+    # Last reviewed full SENSEX backup.  It is never called live unless the
+    # official BSE CSV above is successfully checked on the current IST day.
+    "SENSEX": list(BSE_SENSEX_YAHOO_SYMBOLS.values()),
     "NIFTY MIDCAP 50": [
         "POLYCAB.NS", "PERSISTENT.NS", "DIXON.NS", "COFORGE.NS", "LUPIN.NS",
         "ASTRAL.NS", "CUMMINSIND.NS", "MAXHEALTH.NS", "SUNDARMFIN.NS", "HINDPETRO.NS"
@@ -1375,31 +3623,33 @@ INDEX_BASKET_SOURCES = {
         "url": "https://www.niftyindices.com/IndexConstituent/ind_nifty50list.csv",
         "minimum": 45,
         "maximum": 55,
+        "publisher": "Official NSE Indices public constituent CSV",
     },
     "BANK NIFTY": {
         "url": "https://www.niftyindices.com/IndexConstituent/ind_niftybanklist.csv",
         "minimum": 8,
         "maximum": 20,
+        "publisher": "Official NSE Indices public constituent CSV",
+    },
+    "SENSEX": {
+        "url": "https://www.bseindices.com/AsiaIndexAPI/api/Codewise_IndicesDownload/w?code=16",
+        "minimum": 30,
+        "maximum": 30,
+        "parser": "bse_sensex",
+        "publisher": "Official BSE SENSEX constituent CSV (reviewed NSE chart-symbol map)",
     },
     "NIFTY MIDCAP 50": {
         "url": "https://www.niftyindices.com/IndexConstituent/ind_niftymidcap50list.csv",
         "minimum": 45,
         "maximum": 55,
+        "publisher": "Official NSE Indices public constituent CSV",
     },
 }
 
-FO_UNIVERSE = {
-    "NIFTY": "^NSEI",
-    "BANKNIFTY": "^NSEBANK",
-    "FINNIFTY": "NIFTY_FIN_SERVICE.NS",
-    "RELIANCE": "RELIANCE.NS",
-    "HDFCBANK": "HDFCBANK.NS",
-    "ICICIBANK": "ICICIBANK.NS",
-    "SBIN": "SBIN.NS",
-    "TCS": "TCS.NS",
-    "INFY": "INFY.NS",
-    "TATAMOTORS": "TATAMOTORS.NS"
-}
+# Kept as a compatibility alias for any future chart helper.  Unlike the old
+# generic F&O list, it intentionally contains only the five supported index
+# products and never individual equities.
+FO_UNIVERSE = {name: spec["chart_symbol"] for name, spec in FO_INDEX_UNIVERSE.items()}
 
 HORIZON_MAP = {
     "Intraday (15-Min)": ("5d", "15m", 3),
@@ -1408,14 +3658,77 @@ HORIZON_MAP = {
     "Mid Term (Daily / 2Y)": ("2y", "1d", 8),
     "Long Term (Weekly)": ("5y", "1wk", 10)
 }
+CHART_TIMEFRAME_MAP = {
+    "5 minute": ("5d", "5m", 3),
+    "15 minute": ("5d", "15m", 3),
+    "1 hour": ("1mo", "60m", 4),
+    "1 day": ("1y", "1d", 5),
+    "1 week": ("5y", "1wk", 10),
+}
+FO_INTERVAL_OPTIONS = {
+    "5 minute": "FIVE_MINUTE",
+    "15 minute": "FIFTEEN_MINUTE",
+}
+OFFICIAL_NEWS_SOURCES = [
+    {"name": "SEBI", "category": "Regulatory", "url": "https://www.sebi.gov.in/sebirss.xml"},
+    {"name": "RBI", "category": "Macro", "url": "https://rbi.org.in/pressreleases_rss.xml"},
+    {"name": "PIB", "category": "Government", "url": "https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=1"},
+]
+GLOBAL_MARKET_WATCH = {
+    "S&P 500": "^GSPC",
+    "NASDAQ": "^IXIC",
+    "Dow Jones": "^DJI",
+    "Nikkei 225": "^N225",
+    "Hang Seng": "^HSI",
+}
+
+
+def load_logo_data_uri():
+    logo_path = os.path.join(APP_DIRECTORY, "mahi-trading-logo.png")
+    try:
+        with open(logo_path, "rb") as handle:
+            encoded = base64.b64encode(handle.read()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
+    except OSError:
+        return ""
+
+
+safe_workspace_settings = load_safe_ui_settings()
+saved_asset_universe = safe_workspace_settings.get("asset_universe")
+if saved_asset_universe == "SENSEX watchlist (bundled)":
+    saved_asset_universe = "SENSEX"
+if saved_asset_universe in FALLBACK_INDEX_BASKETS:
+    st.session_state.setdefault("asset_universe", saved_asset_universe)
+if safe_workspace_settings.get("trading_horizon") in HORIZON_MAP:
+    st.session_state.setdefault("trading_horizon", safe_workspace_settings["trading_horizon"])
+if safe_workspace_settings.get("execution_mode") in {"📝 Paper Trading", "⚡ Live Broker"}:
+    st.session_state.setdefault("execution_mode", safe_workspace_settings["execution_mode"])
+if safe_workspace_settings.get("chart_timeframe") in CHART_TIMEFRAME_MAP:
+    st.session_state.setdefault("chart_timeframe", safe_workspace_settings["chart_timeframe"])
+if safe_workspace_settings.get("fo_interval") in FO_INTERVAL_OPTIONS:
+    st.session_state.setdefault("fo_interval", safe_workspace_settings["fo_interval"])
+    st.session_state.setdefault("fo5_interval", safe_workspace_settings["fo_interval"])
+if safe_workspace_settings.get("fo5_index") in FO_INDEX_UNIVERSE:
+    st.session_state.setdefault("fo5_index", safe_workspace_settings["fo5_index"])
+if safe_workspace_settings.get("fo5_interval") in FO_INTERVAL_OPTIONS:
+    st.session_state.setdefault("fo5_interval", safe_workspace_settings["fo5_interval"])
+if safe_workspace_settings.get("fo5_public_timeframe") in FO_PUBLIC_CHART_OPTIONS:
+    st.session_state.setdefault("fo5_public_timeframe", safe_workspace_settings["fo5_public_timeframe"])
+if safe_workspace_settings.get("fo5_band") in {"ATM ±5 strikes", "ATM ±10 strikes"}:
+    st.session_state.setdefault("fo5_band", safe_workspace_settings["fo5_band"])
 
 # --- Header Box ---
 timestamp = ist_now().strftime("%Y-%m-%d %H:%M:%S")
+logo_data_uri = load_logo_data_uri()
+logo_html = f'<img class="brand-logo" src="{logo_data_uri}" alt="Mahi Trading logo">' if logo_data_uri else ""
 
 st.markdown(f"""<div class="header-box">
+<div class="brand-block">
+{logo_html}
 <div>
-<div class="brand-title">Mahi <span class="brand-accent">Trading</span></div>
-<div class="brand-sub">Multi-Asset Algorithmic Intelligence & Automated Risk Exits</div>
+  <div class="brand-title">Mahi <span class="brand-accent">Trading</span></div>
+  <div class="brand-sub">Multi-Asset Market Intelligence &amp; Verified Risk Planning</div>
+</div>
 </div>
 <div style="text-align:right;">
   <span class="status-badge">● DATA SOURCE CHECK</span>
@@ -1437,17 +3750,23 @@ st.markdown("""
 if "force_index_basket_refresh" not in st.session_state:
     st.session_state["force_index_basket_refresh"] = False
 
-u_col1, u_col2, u_col3, u_col4 = st.columns([3.8, 3.8, 2.6, 1.8])
+u_col1, u_col2, u_col3, u_col4, u_col5 = st.columns([3.5, 3.5, 2.4, 1.6, 1.7])
 with u_col1:
-    selected_basket = st.selectbox("Select Asset Universe", list(FALLBACK_INDEX_BASKETS.keys()), label_visibility="collapsed")
+    selected_basket = st.selectbox("Select Asset Universe", list(FALLBACK_INDEX_BASKETS.keys()), label_visibility="collapsed", key="asset_universe")
 with u_col2:
-    selected_horizon = st.selectbox("Select Trading Horizon", list(HORIZON_MAP.keys()), label_visibility="collapsed")
+    selected_horizon = st.selectbox("Select Trading Horizon", list(HORIZON_MAP.keys()), label_visibility="collapsed", key="trading_horizon")
 with u_col3:
-    exec_env = st.selectbox("Execution Mode", ["📝 Paper Trading", "⚡ Live Broker"], label_visibility="collapsed")
+    exec_env = st.selectbox("Execution Mode", ["📝 Paper Trading", "⚡ Live Broker"], label_visibility="collapsed", key="execution_mode")
 with u_col4:
     if st.button("↻ Refresh list", width="stretch", key="refresh_index_membership"):
         st.session_state["force_index_basket_refresh"] = True
         load_active_index_basket.clear()
+        st.rerun()
+with u_col5:
+    if st.button("↻ Refresh data", width="stretch", key="refresh_verified_market_data"):
+        st.session_state["force_index_basket_refresh"] = True
+        st.cache_data.clear()
+        clear_all_short_lived_broker_cache()
         st.rerun()
 
 current_ist = ist_now()
@@ -1484,17 +3803,39 @@ elif basket_snapshot["state"] == "bundled":
 else:
     st.error(f"No verified membership list is available for {selected_basket}. {basket_snapshot['error']}")
 
+persist_c1, persist_c2 = st.columns([3, 7])
+with persist_c1:
+    if st.button("💾 Remember workspace", width="stretch", key="save_safe_ui_settings"):
+        save_error = save_safe_ui_settings({
+            "asset_universe": selected_basket,
+            "trading_horizon": selected_horizon,
+            "execution_mode": exec_env,
+            "chart_timeframe": st.session_state.get("chart_timeframe", "15 minute"),
+            "fo_interval": st.session_state.get("fo_interval", "5 minute"),
+            "fo5_index": st.session_state.get("fo5_index", "NIFTY 50"),
+            "fo5_interval": st.session_state.get("fo5_interval", "5 minute"),
+            "fo5_public_timeframe": st.session_state.get("fo5_public_timeframe", "15 minute"),
+            "fo5_band": st.session_state.get("fo5_band", "ATM ±5 strikes"),
+        })
+        if save_error:
+            st.error(save_error)
+        else:
+            st.success("Saved non-sensitive workspace settings. Broker credentials are not stored here.")
+with persist_c2:
+    st.caption("Refresh data clears delayed/public cache and broker snapshots, then reloads verified sources. Your broker session may still need a fresh login after expiry.")
+
 is_paper_trading = (exec_env == "📝 Paper Trading")
 live_orders_armed = live_order_is_armed()
 period, interval, extrema_order = HORIZON_MAP[selected_horizon]
 
 # Main Tabs
-main_tab_equity, main_tab_fo, tab_paper_ledger, tab_backtest, tab_chart = st.tabs([
+main_tab_equity, main_tab_fo, tab_paper_ledger, tab_backtest, tab_chart, tab_news = st.tabs([
     "📈 Equity Intelligence", 
     "🎯 F&O Intelligence (Derivatives)", 
     "📝 Paper Trading Portfolio",
     "📊 Backtest Engine", 
-    "📉 Technical S/R Charts"
+    "📉 Technical S/R Charts",
+    "🗞️ Market Brief & News"
 ])
 
 # =========================================================================
@@ -1522,19 +3863,6 @@ with main_tab_equity:
     </div>
     """, unsafe_allow_html=True)
 
-    @st.cache_data(ttl=180)
-    def fetch_equity_and_daily_data(symbols: tuple[str, ...], period: str, interval: str):
-        symbols = list(symbols)
-        if not symbols:
-            return symbols, pd.DataFrame(), pd.DataFrame(), "No verified constituent list is available.", ""
-        intraday_data, intraday_message = download_public_chart_data(
-            symbols, period=period, interval=interval, group_by='ticker', progress=False, threads=True,
-        )
-        daily_data, daily_message = download_public_chart_data(
-            symbols, period="1y", interval="1d", group_by='ticker', progress=False, threads=True,
-        )
-        return symbols, intraday_data, daily_data, intraday_message, daily_message
-
     symbols, data, daily_data, equity_intraday_message, equity_daily_message = fetch_equity_and_daily_data(
         tuple(basket_snapshot["symbols"]), period, interval,
     )
@@ -1545,156 +3873,15 @@ with main_tab_equity:
         st.info(
             "Public chart feed did not return usable data for: "
             + ", ".join(unavailable_equity_symbols)
-            + ". Those rows are omitted; no price was substituted."
+            + ". They remain visible as DATA UNAVAILABLE; no price was substituted."
         )
     if equity_daily_message:
         st.caption("Daily public chart data is unavailable; the macro check, where shown, explicitly uses the intraday 50 EMA fallback.")
 
-    rows = []
-    checklists = {}
-    current_live_prices = {}
-
-    for sym in symbols:
-        try:
-            df = data[sym].dropna()
-            if len(df) < 25:
-                continue
-
-            close = df['Close']
-            high = df['High']
-            low = df['Low']
-            volume = df['Volume']
-            open_s = df['Open']
-
-            ema20 = close.ewm(span=20, adjust=False).mean()
-            ema50 = close.ewm(span=50, adjust=False).mean()
-
-            delta = close.diff()
-            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-            rs = gain / loss.replace(0, np.nan)
-            rsi = 100 - (100 / (1 + rs))
-
-            tr1 = high - low
-            tr2 = (high - close.shift(1)).abs()
-            tr3 = (low - close.shift(1)).abs()
-            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-            atr_val = float(tr.rolling(14).mean().iloc[-1])
-
-            typical_price = (high + low + close) / 3.0
-            cum_vol = volume.cumsum()
-            vwap_series = (typical_price * volume).cumsum() / cum_vol.replace(0, np.nan)
-            c_vwap = float(vwap_series.iloc[-1]) if pd.notna(vwap_series.iloc[-1]) else float(close.iloc[-1])
-
-            orb_high = float(high.iloc[0])
-            orb_low = float(low.iloc[0])
-
-            res = float(high.iloc[-extrema_order:].max())
-            sup = float(low.iloc[-extrema_order:].min())
-
-            c_ltp = float(close.iloc[-1])
-            c_prev = float(close.iloc[-2])
-            c_open = float(open_s.iloc[0])
-            chg_pct = ((c_ltp - c_prev) / c_prev) * 100
-            c_rsi = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
-            c_ema20 = float(ema20.iloc[-1])
-            c_ema50 = float(ema50.iloc[-1])
-            cur_vol = float(volume.iloc[-1])
-            avg_vol_20 = float(volume.iloc[-20:].mean()) if len(volume) >= 20 else cur_vol
-
-            clean_sym = sym.replace(".NS", "").replace(".BO", "")
-            current_live_prices[clean_sym] = c_ltp
-
-            # Condition 1: MTF Daily 50 EMA Macro Filter
-            d_ok = False
-            macro_detail = "Daily 50 EMA unavailable"
-            try:
-                df_day = daily_data[sym].dropna()
-                if len(df_day) >= 50:
-                    d_ema = df_day['Close'].ewm(span=50, adjust=False).mean()
-                    c_daily_ema50 = float(d_ema.iloc[-1])
-                    d_ok = c_ltp > c_daily_ema50
-                    macro_detail = f"Daily 50 EMA: ₹{c_daily_ema50:.2f}"
-                else:
-                    d_ok = c_ltp > c_ema50
-                    macro_detail = f"Intraday 50 EMA fallback: ₹{c_ema50:.2f}"
-            except Exception:
-                d_ok = c_ltp > c_ema50
-                macro_detail = f"Intraday 50 EMA fallback: ₹{c_ema50:.2f}"
-
-            # 10-Point Strategy Evaluation
-            c1_pass = d_ok
-            c2_pass = c_ltp > c_vwap
-            c3_pass = c_ltp > orb_high
-            c4_pass = c_ltp > c_ema20
-            c5_pass = c_ltp > c_ema50
-            c6_pass = 50.0 <= c_rsi <= 70.0
-            c7_pass = cur_vol > (1.25 * avg_vol_20)
-            c8_pass = c_ltp > c_open
-            c9_pass = (((c_ltp - sup) / c_ltp) <= 0.02) or (c_ltp >= orb_high)
-            c10_pass = ((res - c_ltp) / c_ltp) >= 0.02
-
-            checks = [
-                ("1. MTF Macro Filter", c1_pass, macro_detail),
-                ("2. VWAP Baseline", c2_pass, f"VWAP: ₹{c_vwap:.2f}"),
-                ("3. ORB Breakout", c3_pass, f"ORB High: ₹{orb_high:.2f}"),
-                ("4. Short-Term Trend", c4_pass, f"20 EMA: ₹{c_ema20:.2f}"),
-                ("5. Intermediate Trend", c5_pass, f"50 EMA: ₹{c_ema50:.2f}"),
-                ("6. RSI Momentum Corridor", c6_pass, f"RSI @ {c_rsi:.1f} (50-70)"),
-                ("7. Volume Expansion", c7_pass, f"{cur_vol:,.0f} vs {1.25*avg_vol_20:,.0f}"),
-                ("8. Positive Session Momentum", c8_pass, f"Open: ₹{c_open:.2f} ({chg_pct:+.2f}%)"),
-                ("9. Support/Breakout Validation", c9_pass, "Near Support or Confirmed ORB"),
-                ("10. Room to Target", c10_pass, f"Res: ₹{res:.2f} (≥2% clearance)")
-            ]
-
-            buy_score = sum(1 for _, met, _ in checks if met)
-            sell_score = 10 - buy_score
-
-            if c_rsi >= 74 and chg_pct > 0:
-                setup = "REVERSAL_WATCH"
-            elif buy_score >= 7:
-                setup = "BUY_SETUP"
-            elif sell_score >= 7:
-                setup = "BEARISH_SETUP"
-            else:
-                setup = "CONSOLIDATION"
-
-            trend_status = "BULLISH (100)" if c_ltp > c_ema50 else "BEARISH (100)"
-
-            checklists[clean_sym] = {
-                "sym": sym,
-                "ltp": c_ltp,
-                "chg": chg_pct,
-                "rsi": c_rsi,
-                "vwap": c_vwap,
-                "orb_high": orb_high,
-                "orb_low": orb_low,
-                "atr": atr_val if (pd.notna(atr_val) and atr_val > 0) else (c_ltp * 0.015),
-                "support": sup,
-                "resistance": res,
-                "checks": checks,
-                "buy_score": buy_score,
-                "sell_score": sell_score,
-                "setup": setup
-            }
-
-            rows.append({
-                "Symbol": clean_sym,
-                "Price": round(c_ltp, 2),
-                "Chg%": round(chg_pct, 2),
-                "Trend": trend_status,
-                "VWAP": round(c_vwap, 2),
-                "RSI": round(c_rsi, 1),
-                "Buy": f"{buy_score}/10",
-                "Sell": f"{sell_score}/10",
-                "Setup": setup
-            })
-        except Exception:
-            continue
-
+    df_results, checklists, current_live_prices = evaluate_equity_intelligence_scan(
+        symbols, data, daily_data, extrema_order,
+    )
     evaluate_paper_positions(current_live_prices)
-
-    df_results = pd.DataFrame(rows)
 
     filtered_df = df_results.copy()
     if setup_filter != "All setups":
@@ -1743,23 +3930,22 @@ with main_tab_equity:
             stop_points = round(float(1.5 * atr_val), 1)
             target_points = round(float(4.5 * atr_val), 1)  # 1:3 RRR
 
-            default_preview_idx = 0 if stock['buy_score'] >= stock['sell_score'] else 1
+            equity_trade_policy = trade_policy_for_horizon(selected_horizon)
+            sizing_sides = ["BUY"] if equity_trade_policy["long_term"] else ["BUY", "SELL"]
+            default_preview_idx = 0 if stock['evidence_summary']['regime'] != "BEARISH" or equity_trade_policy["long_term"] else 1
             preview_action = st.radio(
-                "Risk Preview Direction",
-                ["BUY", "SELL"],
+                "Sizing direction",
+                sizing_sides,
                 index=default_preview_idx,
                 horizontal=True,
                 key=f"equity_preview_side_{active_sym}",
-                help="This changes levels and illustrative P&L only. It does not send an order.",
+                help="Choose BUY or SELL first: the entry, stop, target, P&L, confirmation, and submit button below all use this one side.",
             )
             inspector_preview = calculate_directional_preview(
                 preview_action, stock['ltp'], stop_points, target_points, 1
             )
 
-            items_html = "".join([
-                f'<div class="check-item"><span>{"✅" if passed else "❌"} {rule}</span><span class="{"tag-bull" if passed else "tag-bear"}">{detail}</span></div>'
-                for rule, passed, detail in stock['checks']
-            ])
+            items_html = evidence_items_html(stock['checks'])
 
             st.markdown(f"""
             <div class="inspector-card">
@@ -1784,7 +3970,8 @@ with main_tab_equity:
                     <div>{preview_action} TARGET (1:3): <strong style="color:#34d399">₹{inspector_preview['target_price']:.2f}</strong></div>
                 </div>
                 <div style="font-size:11px; font-weight:700; color:#94a3b8; text-transform:uppercase; margin-bottom:6px; letter-spacing:0.5px;">
-                    SCORE: <span style="color:#34d399;">{stock['buy_score']}/10 BUY</span> &nbsp;·&nbsp; <span style="color:#fb7185;">{stock['sell_score']}/10 SELL</span>
+                    EVIDENCE: <span style="color:#34d399;">{stock['buy_score']} BUY</span> &nbsp;·&nbsp; <span style="color:#fb7185;">{stock['sell_score']} SELL</span> &nbsp;·&nbsp; <span style="color:#fbbf24;">{stock['evidence_summary']['neutral_count']} NEUTRAL</span>
+                    <span style="float:right; color:#cbd5e1;">{stock['evidence_summary']['regime']}</span>
                 </div>
                 {items_html}
             </div>
@@ -1796,8 +3983,12 @@ with main_tab_equity:
             </div>
             """, unsafe_allow_html=True)
 
-            order_mode = st.radio("Order Type", ["Bracket (ROBO Auto-Exit)", "Regular Market"], horizontal=True, label_visibility="collapsed", key=f"mode_{active_sym}")
-            
+            if equity_trade_policy["long_term"]:
+                order_mode = "Regular Market"
+                st.info("Long Term is long-only for new positions: DELIVERY BUY only. New short/SELL and ROBO controls are deliberately hidden.")
+            else:
+                order_mode = st.radio("Order Type", ["Bracket (ROBO Auto-Exit)", "Regular Market"], horizontal=True, label_visibility="collapsed", key=f"mode_{active_sym}")
+
             calc_c1, calc_c2 = st.columns(2)
             with calc_c1:
                 trade_qty = st.number_input("Quantity", min_value=1, value=10, step=1, key=f"qty_{active_sym}")
@@ -1812,591 +4003,566 @@ with main_tab_equity:
                     in_tp_pts = st.number_input("Target Points (₹)", min_value=1.0, value=float(target_points), step=0.5, key=f"tp_{active_sym}")
                 with trail_c:
                     in_trail = st.number_input("Trail (₹)", min_value=0.0, value=1.0, step=0.5, key=f"trail_{active_sym}")
+                try:
+                    equity_preview = calculate_directional_preview(preview_action, trade_limit, in_sl_pts, in_tp_pts, trade_qty)
+                except ValueError as exc:
+                    equity_preview = None
+                    st.error(f"Sizing needs valid values: {exc}")
 
-                equity_preview = calculate_directional_preview(
-                    preview_action, trade_limit, in_sl_pts, in_tp_pts, trade_qty
-                )
-                total_capital_required = equity_preview["gross_notional"]
-                expected_profit = equity_preview["target_pnl"]
-                expected_loss = abs(equity_preview["loss_pnl"])
-                reward_risk_ratio = round(expected_profit / expected_loss, 2) if expected_loss > 0 else 0.0
-
-                st.markdown(f"""
-                <div class="calc-box">
-                    <div class="calc-row">
-                        <span style="color:#94a3b8;">{preview_action} entry notional:</span>
-                        <strong style="color:#ffffff; font-size:14px;">₹{total_capital_required:,.2f}</strong>
+                if equity_preview:
+                    total_notional = equity_preview["gross_notional"]
+                    expected_profit = equity_preview["target_pnl"]
+                    expected_loss = abs(equity_preview["loss_pnl"])
+                    reward_risk_ratio = round(expected_profit / expected_loss, 2) if expected_loss > 0 else 0.0
+                    notional_label = "BUY entry value" if preview_action == "BUY" else "Estimated sale value — intraday short; broker margin not calculated"
+                    st.markdown(f"""
+                    <div class="calc-box">
+                        <div class="calc-row"><span style="color:#94a3b8;">{notional_label}:</span><strong style="color:#ffffff; font-size:14px;">₹{total_notional:,.2f}</strong></div>
+                        <div class="calc-row"><span style="color:#94a3b8;">{preview_action} entry / stop / target:</span><strong style="color:#ffffff;">₹{equity_preview['entry_price']:.2f} / <span style="color:#fb7185">₹{equity_preview['stop_price']:.2f}</span> / <span style="color:#34d399">₹{equity_preview['target_price']:.2f}</span></strong></div>
+                        <div class="calc-row"><span style="color:#94a3b8;">Illustrative P&L at target:</span><strong style="color:#34d399; font-size:14px;">+₹{expected_profit:,.2f}</strong></div>
+                        <div class="calc-row"><span style="color:#94a3b8;">Illustrative P&L at stop:</span><strong style="color:#fb7185; font-size:14px;">-₹{expected_loss:,.2f}</strong></div>
+                        <div class="calc-row" style="border-top:1px solid rgba(255,255,255,0.06); margin-top:4px; padding-top:4px;"><span style="color:#94a3b8;">Risk-to-reward:</span><strong style="color:#00f2fe;">1 : {reward_risk_ratio}</strong></div>
                     </div>
-                    <div class="calc-row">
-                        <span style="color:#94a3b8;">Entry / stop / target:</span>
-                        <strong style="color:#ffffff;">₹{equity_preview['entry_price']:.2f} / <span style="color:#fb7185">₹{equity_preview['stop_price']:.2f}</span> / <span style="color:#34d399">₹{equity_preview['target_price']:.2f}</span></strong>
-                    </div>
-                    <div class="calc-row">
-                        <span style="color:#94a3b8;">Illustrative P&L at target:</span>
-                        <strong style="color:#34d399; font-size:14px;">+₹{expected_profit:,.2f}</strong>
-                    </div>
-                    <div class="calc-row">
-                        <span style="color:#94a3b8;">Illustrative P&L at stop:</span>
-                        <strong style="color:#fb7185; font-size:14px;">-₹{expected_loss:,.2f}</strong>
-                    </div>
-                    <div class="calc-row" style="border-top:1px solid rgba(255,255,255,0.06); margin-top:4px; padding-top:4px;">
-                        <span style="color:#94a3b8;">Net Risk-to-Reward Ratio:</span>
-                        <strong style="color:#00f2fe;">1 : {reward_risk_ratio}</strong>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-                live_buy_confirm = live_sell_confirm = False
-                if not is_paper_trading:
-                    if live_orders_armed:
-                        st.markdown("<div class='live-ready-card'>⚡ <strong>LIVE ORDER MODE ARMED</strong> — confirm the exact side below. A successful response means submitted, not filled.</div>", unsafe_allow_html=True)
-                    else:
-                        st.markdown("<div class='live-arm-card'>🔒 <strong>LIVE ORDER MODE NOT ARMED</strong> — connect Angel One and enable the live-order acknowledgement in the gateway below.</div>", unsafe_allow_html=True)
-                    confirm_c1, confirm_c2 = st.columns(2)
-                    with confirm_c1:
-                        live_buy_confirm = st.checkbox(
-                            f"I understand: submit LIVE BUY {active_sym} ({trade_qty} qty) LIMIT ₹{trade_limit:.2f}; SL offset ₹{in_sl_pts:.2f}; target offset ₹{in_tp_pts:.2f}",
-                            key=f"confirm_robo_buy_{active_sym}", disabled=not live_orders_armed,
+                    """, unsafe_allow_html=True)
+                    live_confirm = False
+                    if not is_paper_trading:
+                        st.markdown("<div class='live-ready-card'>⚡ <strong>LIVE ORDER MODE ARMED</strong> — a broker response means submitted, not filled.</div>" if live_orders_armed else "<div class='live-arm-card'>🔒 <strong>LIVE ORDER MODE NOT ARMED</strong> — connect and arm Angel One below.</div>", unsafe_allow_html=True)
+                        live_confirm = st.checkbox(
+                            f"I understand: submit LIVE {preview_action} {active_sym} ({trade_qty} qty) LIMIT ₹{trade_limit:.2f}; SL offset ₹{in_sl_pts:.2f}; target offset ₹{in_tp_pts:.2f}",
+                            key=f"confirm_robo_{preview_action.lower()}_{active_sym}", disabled=not live_orders_armed,
                         )
-                    with confirm_c2:
-                        live_sell_confirm = st.checkbox(
-                            f"I understand: submit LIVE SELL {active_sym} ({trade_qty} qty) LIMIT ₹{trade_limit:.2f}; SL offset ₹{in_sl_pts:.2f}; target offset ₹{in_tp_pts:.2f}",
-                            key=f"confirm_robo_sell_{active_sym}", disabled=not live_orders_armed,
-                        )
-                    st.caption("ROBO orders are submitted as LIMIT + BO using the displayed stop/target offsets. Trailing is not sent until broker-specific trailing behavior is verified.")
-
-                b_col1, b_col2 = st.columns(2)
-                buy_disabled = not is_paper_trading and not (live_orders_armed and live_buy_confirm)
-                sell_disabled = not is_paper_trading and not (live_orders_armed and live_sell_confirm)
-                btn_prefix = "📝 PAPER" if is_paper_trading else "⚡ LIVE"
-                with b_col1:
-                    btn_robo_buy = st.button(f"🟢 {btn_prefix} BUY ROBO {active_sym}", width="stretch", key=f"btn_buy_{active_sym}", disabled=buy_disabled)
-                with b_col2:
-                    btn_robo_sell = st.button(f"🔴 {btn_prefix} SELL ROBO {active_sym}", width="stretch", key=f"btn_sell_{active_sym}", disabled=sell_disabled)
-
-                if btn_robo_buy or btn_robo_sell:
-                    action_type = "BUY" if btn_robo_buy else "SELL"
-                    if is_paper_trading:
-                        ok, msg = place_paper_order(
-                            symbol=active_sym,
-                            action=action_type,
-                            qty=trade_qty,
-                            entry_price=trade_limit,
-                            sl_pts=in_sl_pts,
-                            tp_pts=in_tp_pts,
-                            trail_pts=in_trail,
-                        )
-                        if ok:
-                            st.success(f"✅ {msg}")
+                        st.caption("ROBO is submitted as LIMIT + BO. Trailing is a planning value only until broker-specific trailing behavior is verified.")
+                    btn_prefix = "📝 PAPER" if is_paper_trading else "⚡ LIVE"
+                    button_key = f"btn_buy_{active_sym}" if preview_action == "BUY" else f"btn_sell_{active_sym}"
+                    action_marker = "🟢" if preview_action == "BUY" else "🔴"
+                    submit_bracket = st.button(
+                        f"{action_marker} {btn_prefix} {preview_action} ROBO {active_sym}", width="stretch", key=button_key,
+                        disabled=not is_paper_trading and not (live_orders_armed and live_confirm),
+                    )
+                    if submit_bracket:
+                        if is_paper_trading:
+                            ok, msg = place_paper_order(active_sym, preview_action, trade_qty, trade_limit, in_sl_pts, in_tp_pts, in_trail)
+                            (st.success if ok else st.error)(f"{'✅' if ok else '❌'} {msg}")
                         else:
-                            st.error(f"❌ {msg}")
-                    else:
-                        with st.spinner("Resolving broker contract and submitting your confirmed ROBO order..."):
-                            success, message, details, broker_ltp = submit_live_equity_from_ui(
-                                st.session_state.get("smart_api"), active_sym, stock["sym"], trade_qty,
-                                action_type, "ROBO", trade_limit, in_sl_pts, in_tp_pts, "INTRADAY",
-                            )
-                        if success:
-                            order_id = details.get("order_id") if isinstance(details, dict) else ""
-                            st.session_state["last_live_submission"] = {
-                                "symbol": active_sym, "action": action_type, "kind": "ROBO",
-                                "order_id": order_id, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            }
-                            st.success(f"✅ LIVE order submitted to Angel One{f' · Order ID: {order_id}' if order_id else ''}. Check the broker order book for OPEN, COMPLETE, or REJECTED status.")
-                            if broker_ltp and broker_ltp.get("ok"):
-                                st.caption(f"Broker LTP verified at submission: ₹{broker_ltp['ltp']:.2f}")
-                        else:
-                            st.error(f"Live order was not submitted: {message}")
+                            with st.spinner("Resolving broker contract and submitting your confirmed ROBO order..."):
+                                success, message, details, broker_ltp = submit_live_equity_from_ui(
+                                    st.session_state.get("smart_api"), active_sym, stock["sym"], trade_qty, preview_action,
+                                    "ROBO", trade_limit, in_sl_pts, in_tp_pts, "INTRADAY", selected_horizon,
+                                )
+                            if success:
+                                order_id = details.get("order_id") if isinstance(details, dict) else ""
+                                st.session_state["last_live_submission"] = {"symbol": active_sym, "action": preview_action, "kind": "ROBO", "order_id": order_id, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+                                st.success(f"✅ LIVE order submitted to Angel One{f' · Order ID: {order_id}' if order_id else ''}. Check the broker order book for final status.")
+                                if broker_ltp and broker_ltp.get("ok"):
+                                    st.caption(f"Broker LTP verified at submission: ₹{broker_ltp['ltp']:.2f}")
+                            else:
+                                st.error(f"Live order was not submitted: {message}")
             else:
-                reg_capital = trade_qty * trade_limit
-                st.markdown(f"""
-                <div class="calc-box">
-                    <div class="calc-row">
-                        <span style="color:#94a3b8;">Total Amount to Invest:</span>
-                        <strong style="color:#ffffff; font-size:14px;">₹{reg_capital:,.2f}</strong>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-                reg_c1, reg_c2 = st.columns(2)
-                with reg_c1:
+                regular_notional = trade_qty * trade_limit
+                notional_label = "Total delivery amount" if equity_trade_policy["long_term"] else ("Estimated buy value" if preview_action == "BUY" else "Estimated sale value — broker margin not calculated")
+                st.markdown(f"""<div class="calc-box"><div class="calc-row"><span style="color:#94a3b8;">{notional_label}:</span><strong style="color:#ffffff; font-size:14px;">₹{regular_notional:,.2f}</strong></div><div class="calc-row"><span style="color:#94a3b8;">Sizing side:</span><strong style="color:{'#34d399' if preview_action == 'BUY' else '#fb7185'};">{preview_action}</strong></div></div>""", unsafe_allow_html=True)
+                if equity_trade_policy["long_term"]:
+                    prod = "DELIVERY"
+                    st.caption("Delivery BUY uses the broker's execution price; entry above is planning-only.")
+                else:
                     prod = st.selectbox("Product", ["INTRADAY", "DELIVERY"], key=f"prod_{active_sym}")
-                with reg_c2:
-                    st.caption("Market orders use the broker's execution price; Entry Price above is preview-only.")
-
-                live_market_buy_confirm = live_market_sell_confirm = False
+                    st.caption("Market orders use the broker's execution price; entry above is planning-only.")
+                live_confirm = False
                 if not is_paper_trading:
-                    if live_orders_armed:
-                        st.markdown("<div class='live-ready-card'>⚡ <strong>LIVE MARKET MODE ARMED</strong> — market orders may be converted by the broker to market-price-protection limit orders.</div>", unsafe_allow_html=True)
-                    else:
-                        st.markdown("<div class='live-arm-card'>🔒 <strong>LIVE MARKET MODE NOT ARMED</strong> — enable it in the broker gateway below.</div>", unsafe_allow_html=True)
-                    market_confirm_c1, market_confirm_c2 = st.columns(2)
-                    with market_confirm_c1:
-                        live_market_buy_confirm = st.checkbox(
-                            f"I understand: submit LIVE MARKET BUY {active_sym} ({trade_qty} qty)",
-                            key=f"confirm_market_buy_{active_sym}", disabled=not live_orders_armed,
-                        )
-                    with market_confirm_c2:
-                        live_market_sell_confirm = st.checkbox(
-                            f"I understand: submit LIVE MARKET SELL {active_sym} ({trade_qty} qty)",
-                            key=f"confirm_market_sell_{active_sym}", disabled=not live_orders_armed,
-                        )
-
-                market_b1, market_b2 = st.columns(2)
+                    st.markdown("<div class='live-ready-card'>⚡ <strong>LIVE MARKET MODE ARMED</strong> — market orders may be converted by the broker to price-protection limits.</div>" if live_orders_armed else "<div class='live-arm-card'>🔒 <strong>LIVE MARKET MODE NOT ARMED</strong> — enable it in the gateway below.</div>", unsafe_allow_html=True)
+                    live_confirm = st.checkbox(
+                        f"I understand: submit LIVE MARKET {preview_action} {active_sym} ({trade_qty} qty) as {prod}",
+                        key=f"confirm_market_{preview_action.lower()}_{active_sym}", disabled=not live_orders_armed,
+                    )
                 market_prefix = "📝 PAPER" if is_paper_trading else "⚡ LIVE"
-                with market_b1:
-                    btn_reg_buy = st.button(
-                        f"🟢 {market_prefix} BUY MARKET {active_sym}", width="stretch", key=f"mkt_buy_{active_sym}",
-                        disabled=not is_paper_trading and not (live_orders_armed and live_market_buy_confirm),
-                    )
-                with market_b2:
-                    btn_reg_sell = st.button(
-                        f"🔴 {market_prefix} SELL MARKET {active_sym}", width="stretch", key=f"mkt_sell_{active_sym}",
-                        disabled=not is_paper_trading and not (live_orders_armed and live_market_sell_confirm),
-                    )
-
-                if btn_reg_buy or btn_reg_sell:
-                    action_type = "BUY" if btn_reg_buy else "SELL"
+                market_key = f"mkt_buy_{active_sym}" if preview_action == "BUY" else f"mkt_sell_{active_sym}"
+                action_marker = "🟢" if preview_action == "BUY" else "🔴"
+                submit_market = st.button(
+                    f"{action_marker} {market_prefix} {preview_action} MARKET {active_sym}", width="stretch", key=market_key,
+                    disabled=not is_paper_trading and not (live_orders_armed and live_confirm),
+                )
+                if submit_market:
                     if is_paper_trading:
-                        ok, msg = place_paper_order(active_sym, action_type, trade_qty, trade_limit, stop_points, target_points)
-                        if ok:
-                            st.success(f"✅ {msg}")
-                        else:
-                            st.error(f"❌ {msg}")
+                        ok, msg = place_paper_order(active_sym, preview_action, trade_qty, trade_limit, stop_points, target_points)
+                        (st.success if ok else st.error)(f"{'✅' if ok else '❌'} {msg}")
                     else:
                         with st.spinner("Resolving broker contract and submitting your confirmed market order..."):
                             success, message, details, broker_ltp = submit_live_equity_from_ui(
-                                st.session_state.get("smart_api"), active_sym, stock["sym"], trade_qty,
-                                action_type, "NORMAL", trade_limit, stop_points, target_points, prod,
+                                st.session_state.get("smart_api"), active_sym, stock["sym"], trade_qty, preview_action,
+                                "NORMAL", trade_limit, stop_points, target_points, prod, selected_horizon,
                             )
                         if success:
                             order_id = details.get("order_id") if isinstance(details, dict) else ""
-                            st.session_state["last_live_submission"] = {
-                                "symbol": active_sym, "action": action_type, "kind": "MARKET",
-                                "order_id": order_id, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            }
-                            st.success(f"✅ LIVE market order submitted to Angel One{f' · Order ID: {order_id}' if order_id else ''}. Check the broker order book for fill status.")
+                            st.session_state["last_live_submission"] = {"symbol": active_sym, "action": preview_action, "kind": "MARKET", "order_id": order_id, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+                            st.success(f"✅ LIVE market order submitted to Angel One{f' · Order ID: {order_id}' if order_id else ''}. Check the broker order book for final status.")
                             if broker_ltp and broker_ltp.get("ok"):
                                 st.caption(f"Broker LTP verified at submission: ₹{broker_ltp['ltp']:.2f}")
-                        else:
-                            st.error(f"Live order was not submitted: {message}")
+                            else:
+                                st.error(f"Live order was not submitted: {message}")
+
 
 # =========================================================================
-# TAB 2: F&O INTELLIGENCE (10-POINT STRATEGY & AUTOMATED STRIKE SELECTION)
+# TAB 2: FOCUSED FIVE-INDEX F&O INTRADAY DESK
 # =========================================================================
 with main_tab_fo:
+    render_fo_index_desk(is_paper_trading, live_orders_armed, compact=True)
+
+# Previous generic-contract table retained as unreachable reference while the
+# focused five-index desk above is tested. It must not render or fetch data.
+if False:
     st.markdown("""
-    <div class="disclaimer-banner">
-        Derivatives technical screen. Option prices, lot size, and Greeks appear only after an authenticated Angel One contract lookup; no PCR, OI, IV, or Delta is inferred here.
-    </div>
+    <div class="disclaimer-banner"><strong>F&amp;O Contract Desk</strong> — choose an Angel One NFO contract from the left. The right panel evaluates only that selected CE/PE premium with real broker data. Unselected rows show master metadata only; no premium, Greeks, OI, or score is guessed.</div>
     """, unsafe_allow_html=True)
+    fo_controls_1, fo_controls_2 = st.columns([3, 2])
+    with fo_controls_1:
+        fo_interval_label = st.selectbox("Intraday candle interval", list(FO_INTERVAL_OPTIONS.keys()), key="fo_interval")
+        fo_interval = FO_INTERVAL_OPTIONS[fo_interval_label]
+    with fo_controls_2:
+        if st.button("↻ Refresh Angel One master", width="stretch", key="refresh_fo_master_split"):
+            load_angel_option_master.clear()
+            st.rerun()
 
-    fo_tickers = list(FO_UNIVERSE.values())
-    
-    @st.cache_data(ttl=180)
-    def fetch_fo_market_data():
-        # Fetch Intraday and Daily for 10-Point Evaluation on Derivatives Universe
-        fo_intra, intraday_message = download_public_chart_data(
-            fo_tickers, period=period, interval=interval, group_by='ticker', progress=False, threads=True,
-        )
-        fo_daily, daily_message = download_public_chart_data(
-            fo_tickers, period="1y", interval="1d", group_by='ticker', progress=False, threads=True,
-        )
-        return fo_intra, fo_daily, intraday_message, daily_message
-
-    fo_intra, fo_daily, fo_intraday_message, fo_daily_message = fetch_fo_market_data()
-    unavailable_fo_symbols = missing_public_chart_symbols(fo_intra, fo_tickers)
-    if fo_intraday_message:
-        st.warning(f"Public underlying intraday chart feed unavailable — {fo_intraday_message} No substitute prices are shown.")
-    elif unavailable_fo_symbols:
-        st.info(
-            "Public underlying chart feed did not return usable data for: "
-            + ", ".join(unavailable_fo_symbols)
-            + ". Those rows are omitted; option pricing still requires Angel One."
-        )
-    if fo_daily_message:
-        st.caption("Daily public chart data is unavailable; any macro check shown explicitly uses the intraday 50 EMA fallback.")
-
-    fo_rows = []
-    fo_checklists = {}
-
-    for name, ticker in FO_UNIVERSE.items():
-        try:
-            f_df = fo_intra[ticker].dropna()
-            if len(f_df) < 20:
-                continue
-
-            f_close = f_df['Close']
-            f_high = f_df['High']
-            f_low = f_df['Low']
-            f_vol = f_df['Volume']
-            f_open = f_df['Open']
-
-            c_ltp = float(f_close.iloc[-1])
-            c_prev = float(f_close.iloc[-2])
-            c_open = float(f_open.iloc[0])
-            f_chg = ((c_ltp - c_prev) / c_prev) * 100
-
-            # Intraday Indicators
-            f_ema20 = float(f_close.ewm(span=20, adjust=False).mean().iloc[-1])
-            f_ema50 = float(f_close.ewm(span=50, adjust=False).mean().iloc[-1])
-
-            # RSI
-            f_delta = f_close.diff()
-            f_gain = (f_delta.where(f_delta > 0, 0)).rolling(14).mean()
-            f_loss = (-f_delta.where(f_delta < 0, 0)).rolling(14).mean()
-            f_rs = f_gain / f_loss.replace(0, np.nan)
-            f_rsi = float((100 - (100 / (1 + f_rs))).iloc[-1]) if pd.notna(f_rs.iloc[-1]) else 50.0
-
-            # Intraday VWAP
-            f_typical = (f_high + f_low + f_close) / 3.0
-            f_cum_vol = f_vol.cumsum()
-            f_vwap_series = (f_typical * f_vol).cumsum() / f_cum_vol.replace(0, np.nan)
-            c_vwap = float(f_vwap_series.iloc[-1]) if pd.notna(f_vwap_series.iloc[-1]) else c_ltp
-
-            # ORB Range
-            orb_high = float(f_high.iloc[0])
-            orb_low = float(f_low.iloc[0])
-
-            # Dynamic Support & Resistance
-            f_res = float(f_high.iloc[-extrema_order:].max())
-            f_sup = float(f_low.iloc[-extrema_order:].min())
-
-            cur_vol = float(f_vol.iloc[-1])
-            avg_vol_20 = float(f_vol.iloc[-20:].mean()) if len(f_vol) >= 20 else cur_vol
-
-            # MTF Daily 50 EMA Macro Alignment
-            d_ok = False
-            macro_detail = "Daily 50 EMA unavailable"
-            try:
-                f_d_df = fo_daily[ticker].dropna()
-                if len(f_d_df) >= 50:
-                    d_ema = f_d_df['Close'].ewm(span=50, adjust=False).mean()
-                    f_daily_ema50 = float(d_ema.iloc[-1])
-                    d_ok = c_ltp > f_daily_ema50
-                    macro_detail = f"Daily 50 EMA: ₹{f_daily_ema50:.2f}"
-                else:
-                    d_ok = c_ltp > f_ema50
-                    macro_detail = f"Intraday 50 EMA fallback: ₹{f_ema50:.2f}"
-            except Exception:
-                d_ok = c_ltp > f_ema50
-                macro_detail = f"Intraday 50 EMA fallback: ₹{f_ema50:.2f}"
-
-            # 10-Point Strategy Evaluation
-            c1_pass = d_ok
-            c2_pass = c_ltp > c_vwap
-            c3_pass = c_ltp > orb_high
-            c4_pass = c_ltp > f_ema20
-            c5_pass = c_ltp > f_ema50
-            c6_pass = 50.0 <= f_rsi <= 70.0
-            c7_pass = cur_vol > (1.25 * avg_vol_20)
-            c8_pass = c_ltp > c_open
-            c9_pass = (((c_ltp - f_sup) / c_ltp) <= 0.02) or (c_ltp >= orb_high)
-            c10_pass = ((f_res - c_ltp) / c_ltp) >= 0.02
-
-            checks = [
-                ("1. MTF Macro Filter", c1_pass, macro_detail),
-                ("2. VWAP Baseline", c2_pass, f"VWAP: ₹{c_vwap:.2f}"),
-                ("3. ORB Breakout", c3_pass, f"ORB High: ₹{orb_high:.2f}"),
-                ("4. Short-Term Trend", c4_pass, f"20 EMA: ₹{f_ema20:.2f}"),
-                ("5. Intermediate Trend", c5_pass, f"50 EMA: ₹{f_ema50:.2f}"),
-                ("6. RSI Momentum Corridor", c6_pass, f"RSI @ {f_rsi:.1f} (50-70)"),
-                ("7. Volume Expansion", c7_pass, f"{cur_vol:,.0f} vs {1.25*avg_vol_20:,.0f}"),
-                ("8. Positive Session Momentum", c8_pass, f"Open: ₹{c_open:.2f} ({f_chg:+.2f}%)"),
-                ("9. Support/Breakout Validation", c9_pass, "Near Support or Confirmed ORB"),
-                ("10. Room to Target", c10_pass, f"Res: ₹{f_res:.2f} (≥2% clearance)")
-            ]
-
-            buy_score = sum(1 for _, met, _ in checks if met)
-            sell_score = 10 - buy_score
-
-            # This is a technical bias on the underlying, not an option-chain metric.
-            # Actual expiry, strike, lot size, LTP and Greeks are loaded from Angel One below.
-            if buy_score >= 7:
-                recommended_opt = "CALL (CE)"
-                rec_rationale = "Technical bullish bias. Choose a broker-listed CE below; no Delta or payoff has been assumed."
-                bias_tag = "STRONG_BULLISH"
-            elif sell_score >= 7:
-                recommended_opt = "PUT (PE)"
-                rec_rationale = "Technical bearish bias. Choose a broker-listed PE below; no Delta or payoff has been assumed."
-                bias_tag = "STRONG_BEARISH"
-            else:
-                recommended_opt = "CALL (CE)" if buy_score >= sell_score else "PUT (PE)"
-                rec_rationale = "Mixed technical bias. Review the actual broker-listed option chain before making any decision."
-                bias_tag = "CONSOLIDATION"
-
-            fo_checklists[name] = {
-                "ltp": c_ltp,
-                "chg": f_chg,
-                "recommended_opt": recommended_opt,
-                "rec_rationale": rec_rationale,
-                "bias_tag": bias_tag,
-                "vwap": c_vwap,
-                "orb_high": orb_high,
-                "checks": checks,
-                "buy_score": buy_score,
-                "sell_score": sell_score
-            }
-
-            fo_rows.append({
-                "Contract": name,
-                "Underlying LTP": round(c_ltp, 2),
-                "Chg%": round(f_chg, 2),
-                "Score": f"{buy_score}/10 Buy" if buy_score >= sell_score else f"{sell_score}/10 Sell",
-                "Technical Bias": recommended_opt.split()[0],
-                "Data note": "Underlying chart feed may be delayed"
-            })
-        except Exception:
-            continue
-
-    df_fo = pd.DataFrame(fo_rows)
-
-    fo_left, fo_right = st.columns([6.4, 3.6])
-
-    with fo_left:
-        fo_grid = st.dataframe(
-            df_fo,
-            width="stretch",
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            column_config={
-                "Underlying LTP": st.column_config.NumberColumn(format="₹%.2f"),
-                "Chg%": st.column_config.NumberColumn(format="%+.2f%%"),
-            },
-            height=620
-        )
-
-    with fo_right:
-        active_fo = None
-        if fo_grid.selection and fo_grid.selection.rows:
-            fo_sel_idx = fo_grid.selection.rows[0]
-            if fo_sel_idx < len(df_fo):
-                active_fo = df_fo.iloc[fo_sel_idx]["Contract"]
-
-        if not active_fo:
-            active_fo = df_fo.iloc[0]["Contract"] if not df_fo.empty else "NIFTY"
-
-        if active_fo in fo_checklists:
-            fo_item = fo_checklists[active_fo]
-            fo_chg_c = "#34d399" if fo_item['chg'] >= 0 else "#fb7185"
-
-            fo_items_html = "".join([
-                f'<div class="check-item"><span>{"✅" if passed else "❌"} {rule}</span><span class="{"tag-bull" if passed else "tag-bear"}">{detail}</span></div>'
-                for rule, passed, detail in fo_item['checks']
-            ])
-
-            st.markdown(f"""
-            <div class="inspector-card">
-                <div style="display:flex; justify-content:space-between; align-items:flex-start;">
-                    <div>
-                        <div style="font-size:22px; font-weight:800; color:#fff; font-family:'JetBrains Mono', monospace;">{active_fo} F&O</div>
-                        <div style="font-size:24px; font-weight:800; color:#fff; margin: 4px 0;">
-                            ₹{fo_item['ltp']:.2f} <span style="font-size:13px; color:{fo_chg_c}">({fo_item['chg']:+.2f}%)</span>
-                        </div>
-                    </div>
-                    <span style="background:rgba(0, 242, 254, 0.12); border:1px solid rgba(0, 242, 254, 0.3); color:#00f2fe; font-size:11px; padding:4px 8px; border-radius:6px; font-weight:700;">
-                        {fo_item['bias_tag']}
-                    </span>
-                </div>
-                <div style="margin: 8px 0; padding: 8px 12px; background:rgba(30, 41, 59, 0.7); border-left: 3px solid #00f2fe; border-radius:4px; font-size:11px; color:#cbd5e1;">
-                    🎯 <strong>System Recommendation:</strong><br>{fo_item['rec_rationale']}
-                </div>
-                <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom: 8px; padding: 6px 12px; background:rgba(15, 23, 42, 0.6); border-radius:6px;">
-                    <div>VWAP: <strong style="color:#00f2fe;">₹{fo_item['vwap']:.2f}</strong></div>
-                    <div>ORB HIGH: <strong style="color:#fbbf24;">₹{fo_item['orb_high']:.2f}</strong></div>
-                    <div>Option data: <strong>Broker required</strong></div>
-                </div>
-                <div style="font-size:11px; font-weight:700; color:#94a3b8; text-transform:uppercase; margin-bottom:6px; letter-spacing:0.5px;">
-                    SCORE: <span style="color:#34d399;">{fo_item['buy_score']}/10 BUY</span> &nbsp;·&nbsp; <span style="color:#fb7185;">{fo_item['sell_score']}/10 SELL</span>
-                </div>
-                {fo_items_html}
-            </div>
-            """, unsafe_allow_html=True)
-
-            # Real option contract selector. Metadata comes from Angel One's published
-            # instrument master; LTP/Greeks/candles require the authenticated session.
-            st.markdown("""
-            <div class="bottom-card" style="margin-top:12px; padding:12px;">
-                <div style="font-size:13px; font-weight:700; color:#fff; margin-bottom:5px;">🔗 Angel One Option Contract & Risk Preview</div>
-                <div style="font-size:11px; color:#94a3b8;">No manual CSV or estimated premium. Contract metadata is loaded from Angel One; pricing is an authenticated broker snapshot.</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-            master_rows, master_error = load_angel_option_master()
-            option_contracts = extract_option_contracts(master_rows, active_fo) if master_rows else []
-
-            if master_error:
-                st.error(master_error)
-            elif not option_contracts:
-                st.warning(f"No Angel One NFO option contracts are currently available for {active_fo}. No contract details or estimates are shown.")
-            else:
-                expiry_values = []
-                expiry_labels = {}
-                for contract in option_contracts:
-                    expiry = contract["expiry_raw"]
-                    if expiry not in expiry_labels:
-                        expiry_values.append(expiry)
-                        expiry_labels[expiry] = contract["expiry_label"]
+    master_rows, master_error = load_angel_option_master()
+    if master_error:
+        st.error(master_error)
+        st.caption("No option price, OI, Greek, margin, or technical value is substituted while the official master is unavailable.")
+    else:
+        option_underlyings = extract_option_underlyings(master_rows)
+        if not option_underlyings:
+            st.warning("No current non-expired NFO option underlying was available in Angel One's master.")
+        else:
+            filter_1, filter_2, filter_3, filter_4 = st.columns([2.5, 2.2, 1.6, 3.7])
+            with filter_1:
+                selected_underlying = st.selectbox("Underlying", option_underlyings, key="fo_underlying")
+            option_contracts = extract_option_contracts(master_rows, selected_underlying)
+            expiry_values = list(dict.fromkeys(contract["expiry_raw"] for contract in option_contracts))
+            expiry_labels = {contract["expiry_raw"]: contract["expiry_label"] for contract in option_contracts}
+            with filter_2:
                 selected_expiry = st.selectbox(
-                    "Expiry (Angel One master)",
-                    expiry_values,
+                    "Expiry", expiry_values,
                     format_func=lambda value: expiry_labels[value],
-                    key=f"option_expiry_{active_fo}",
+                    key=f"fo_expiry_table_{selected_underlying}",
                 )
-                expiry_contracts = [row for row in option_contracts if row["expiry_raw"] == selected_expiry]
-                available_sides = sorted({row["side"] for row in expiry_contracts})
-                preferred_side = "CE" if fo_item["recommended_opt"] == "CALL (CE)" else "PE"
-                preferred_index = available_sides.index(preferred_side) if preferred_side in available_sides else 0
-
-                opt_c1, opt_c2 = st.columns(2)
-                with opt_c1:
-                    option_side = st.selectbox(
-                        "Option side", available_sides, index=preferred_index,
-                        format_func=lambda side: "CALL (CE)" if side == "CE" else "PUT (PE)",
-                        key=f"option_side_{active_fo}_{selected_expiry}",
-                    )
-                side_contracts = [row for row in expiry_contracts if row["side"] == option_side]
-                strikes = sorted({row["strike"] for row in side_contracts})
-                nearest_strike = min(strikes, key=lambda strike: abs(strike - fo_item["ltp"]))
-                with opt_c2:
-                    selected_strike = st.selectbox(
-                        "Strike (Angel One master)", strikes,
-                        index=strikes.index(nearest_strike),
-                        format_func=lambda strike: f"₹{strike:,.2f}",
-                        key=f"option_strike_{active_fo}_{selected_expiry}_{option_side}",
-                    )
-                selected_contract = next(
-                    row for row in side_contracts if row["strike"] == selected_strike
+            with filter_3:
+                side_filter = st.selectbox(
+                    "CE / PE", ["All", "CE", "PE"],
+                    format_func=lambda value: "All sides" if value == "All" else "CALL (CE)" if value == "CE" else "PUT (PE)",
+                    key=f"fo_side_table_{selected_underlying}_{selected_expiry}",
+                )
+            with filter_4:
+                contract_search = st.text_input(
+                    "Find contract / strike", placeholder="Search symbol or strike…",
+                    key=f"fo_contract_search_{selected_underlying}_{selected_expiry}",
                 )
 
+            visible_contracts = [
+                contract for contract in option_contracts
+                if contract["expiry_raw"] == selected_expiry and (side_filter == "All" or contract["side"] == side_filter)
+            ]
+            if contract_search.strip():
+                search_term = contract_search.strip().upper()
+                visible_contracts = [
+                    contract for contract in visible_contracts
+                    if search_term in contract["symbol"].upper() or search_term in f"{contract['strike']:g}".upper()
+                ]
+            visible_contracts = sorted(visible_contracts, key=lambda contract: (contract["strike"], contract["side"], contract["symbol"]))
+
+            if not visible_contracts:
+                st.info("No Angel One contracts match these filters. Change expiry, side, or the search text.")
+            else:
+                selected_contract = choose_fo_contract(
+                    visible_contracts, st.session_state.get("fo_selected_contract_token"),
+                )
+                st.session_state["fo_selected_contract_token"] = str(selected_contract["token"])
                 broker_client = st.session_state.get("smart_api")
                 option_snapshot = get_option_snapshot_for_ui(broker_client, selected_contract)
-                greeks_snapshot = get_option_greeks_for_ui(broker_client, active_fo, selected_expiry)
+                candle_snapshot = get_option_candles_for_ui(broker_client, selected_contract, fo_interval)
+                option_candles = (
+                    normalise_broker_option_candles(candle_snapshot["candles"])
+                    if candle_snapshot.get("ok") else pd.DataFrame()
+                )
+                option_evidence = evaluate_intraday_option_evidence(option_candles)
+                fo_trade_gate = build_fo_trade_gate(option_snapshot, candle_snapshot, option_evidence)
+                selected_greeks = {}
+                greeks_snapshot = get_option_greeks_for_ui(broker_client, selected_underlying, selected_expiry)
+                if greeks_snapshot.get("ok"):
+                    selected_greeks = selected_contract_greeks(greeks_snapshot["rows"], selected_contract)
+
+                fo_left, fo_right = st.columns([6.6, 3.4])
+                with fo_left:
+                    st.markdown("<h4 style='color:#fff; margin:0 0 8px;'>Broker-listed F&amp;O contracts</h4>", unsafe_allow_html=True)
+                    fo_watchlist_rows = build_fo_contract_watchlist_rows(
+                        visible_contracts, selected_contract, option_snapshot, candle_snapshot, option_evidence,
+                    )
+                    fo_grid = st.dataframe(
+                        pd.DataFrame(fo_watchlist_rows),
+                        width="stretch",
+                        hide_index=True,
+                        on_select="rerun",
+                        selection_mode="single-row",
+                        column_config={
+                            "Strike": st.column_config.NumberColumn(format="₹%.2f"),
+                            "Tick": st.column_config.NumberColumn(format="₹%.2f"),
+                        },
+                        height=620,
+                        key=f"fo_contract_grid_{selected_underlying}_{selected_expiry}_{side_filter}",
+                    )
+                    if fo_grid.selection and fo_grid.selection.rows:
+                        selected_row = fo_grid.selection.rows[0]
+                        if selected_row < len(visible_contracts):
+                            next_token = str(visible_contracts[selected_row]["token"])
+                            if next_token != str(selected_contract["token"]):
+                                st.session_state["fo_selected_contract_token"] = next_token
+                                st.rerun()
+                    st.caption(
+                        f"{len(visible_contracts)} broker-listed contracts shown · selected: {selected_contract['symbol']}. "
+                        "Only this selected row can have broker premium and technical fields."
+                    )
+
+                with fo_right:
+                    if st.button("↻ Refresh selected", width="stretch", key=f"refresh_fo_split_{selected_contract['token']}_{fo_interval}"):
+                        clear_selected_option_broker_cache(selected_contract, selected_underlying, selected_expiry, fo_interval)
+                        st.rerun()
+
+                    option_row = build_fo_intelligence_row(
+                        selected_contract, option_snapshot, candle_snapshot, option_evidence,
+                    )
+                    premium_text = option_row["Premium"]
+                    premium_color = "#34d399" if option_snapshot.get("ok") else "#fbbf24"
+                    st.markdown(f"""
+                    <div class="inspector-card">
+                        <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">
+                            <div>
+                                <div style="font-size:19px; font-weight:800; color:#fff; font-family:'JetBrains Mono', monospace; word-break:break-word;">{html.escape(selected_contract['symbol'])}</div>
+                                <div style="font-size:25px; font-weight:800; color:{premium_color}; margin:4px 0;">{html.escape(premium_text)}</div>
+                            </div>
+                            <span style="background:rgba(0,242,254,0.12); border:1px solid rgba(0,242,254,0.30); color:#67e8f9; font-size:10px; padding:4px 7px; border-radius:6px; font-weight:800;">{html.escape(option_row['Setup'])}</span>
+                        </div>
+                        <div style="display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap; font-size:11px; margin:10px 0; padding:8px 10px; background:rgba(30,41,59,0.6); border-radius:6px;">
+                            <span>Expiry <strong>{html.escape(selected_contract['expiry_label'])}</strong></span>
+                            <span>{html.escape('CALL (CE)' if selected_contract['side'] == 'CE' else 'PUT (PE)')}</span>
+                            <span>Strike <strong>₹{selected_contract['strike']:,.2f}</strong></span>
+                            <span>Lot <strong>{selected_contract['lot_size']}</strong></span>
+                        </div>
+                        <div style="font-size:11px; font-weight:700; color:#94a3b8; text-transform:uppercase; letter-spacing:0.4px;">
+                            {html.escape(option_row['Trend'])} · <span style="color:#34d399;">{html.escape(option_row['Buy'])} BUY</span> · <span style="color:#fb7185;">{html.escape(option_row['Sell'])} SELL</span>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    if option_snapshot.get("ok"):
+                        st.caption(broker_snapshot_caption(option_snapshot))
+                    elif option_snapshot.get("state") == "disconnected":
+                        st.warning("Connect Angel One below to load this selected contract's real LTP, intraday chart, Greeks, and OI. No stale or estimated premium is used.")
+                    else:
+                        st.error(f"Selected-contract price unavailable: {option_snapshot.get('message', 'Unknown broker error.')}")
+
+                    st.markdown(
+                        """
+                        <div class="fo-trade-gate {tone}">
+                          <div class="fo-gate-heading">
+                            <span>🛡️ F&amp;O TRADE GATE</span>
+                            <span class="fo-gate-decision">{decision_note}</span>
+                          </div>
+                          <div class="fo-gate-grid">
+                            <div class="fo-gate-stat"><div class="fo-gate-label">Decision</div><div class="fo-gate-value">{decision}</div></div>
+                            <div class="fo-gate-stat"><div class="fo-gate-label">Conditions</div><div class="fo-gate-value">{conditions}</div><div class="fo-gate-note">{condition_detail}</div></div>
+                            <div class="fo-gate-stat"><div class="fo-gate-label">Risk status</div><div class="fo-gate-value">{risk_status}</div><div class="fo-gate-note">Selected contract only</div></div>
+                          </div>
+                          <div class="fo-gate-message">{message}</div>
+                        </div>
+                        """.format(**{key: html.escape(str(value)) for key, value in fo_trade_gate.items()}),
+                        unsafe_allow_html=True,
+                    )
+
+                    st.markdown("<div class='bottom-card' style='margin-top:12px;'><div class='bottom-title'>Selected premium conditions</div><div style='font-size:11px;color:#94a3b8;'>Buy/Sell scores are for this CE/PE premium only—not the underlying direction, PCR, or option-chain flow.</div></div>", unsafe_allow_html=True)
+                    if option_evidence.get("message"):
+                        st.caption(option_evidence["message"])
+                    else:
+                        st.markdown(evidence_items_html(option_evidence["checks"]), unsafe_allow_html=True)
+                    if selected_greeks:
+                        st.caption("Broker-reported only: " + " · ".join(f"{label}: {value}" for label, value in selected_greeks.items()) + f" · {broker_snapshot_caption(greeks_snapshot)}")
+                    elif broker_client is not None and not greeks_snapshot.get("ok"):
+                        st.caption(f"Broker Greeks/OI unavailable: {greeks_snapshot.get('message', 'Unknown response.')}")
+
+                    if fo_trade_gate["allow_risk_preview"]:
+                        st.markdown("<div class='bottom-card' style='margin-top:14px;'><div class='bottom-title'>💰 Selected Option Intraday Risk Preview</div><div style='font-size:11px;color:#94a3b8;'>Uses the selected broker premium. Charges, slippage, margin, and assignment risk are excluded.</div></div>", unsafe_allow_html=True)
+                        risk_1, risk_2 = st.columns(2)
+                        with risk_1:
+                            lots = st.number_input("Lots", min_value=1, value=1, step=1, key=f"fo_lots_{selected_contract['token']}")
+                        with risk_2:
+                            option_action = st.radio("Premium action", ["BUY", "SELL"], horizontal=True, key=f"fo_action_{selected_contract['token']}")
+                        minimum_step = float(selected_contract["tick_size"] or 0.05)
+                        risk_3, risk_4 = st.columns(2)
+                        with risk_3:
+                            default_stop = max(minimum_step, round(option_snapshot["ltp"] * 0.15, 2))
+                            option_stop = st.number_input("Risk points (₹)", min_value=minimum_step, value=default_stop, step=minimum_step, key=f"fo_stop_{selected_contract['token']}")
+                        with risk_4:
+                            option_target = st.number_input("Target points (₹)", min_value=minimum_step, value=float(round(option_stop * 3, 2)), step=minimum_step, key=f"fo_target_{selected_contract['token']}")
+                        option_quantity = int(lots) * selected_contract["lot_size"]
+                        try:
+                            option_preview = calculate_directional_preview(option_action, option_snapshot["ltp"], option_stop, option_target, option_quantity)
+                        except ValueError as exc:
+                            option_preview = None
+                            st.error(f"Option sizing needs valid values: {exc}")
+                        if option_preview:
+                            premium_label = "Premium outlay before charges" if option_action == "BUY" else "Gross premium received — broker margin is not calculated"
+                            st.markdown(f"<div class='calc-box'><div class='calc-row'><span style='color:#94a3b8;'>Quantity:</span><strong>{int(lots)} lot × {selected_contract['lot_size']} = {option_quantity}</strong></div><div class='calc-row'><span style='color:#94a3b8;'>{premium_label}:</span><strong style='color:#00f2fe;'>₹{option_preview['gross_notional']:,.2f}</strong></div><div class='calc-row'><span style='color:#94a3b8;'>{option_action} entry / stop / target:</span><strong>₹{option_preview['entry_price']:.2f} / <span style='color:#fb7185'>₹{option_preview['stop_price']:.2f}</span> / <span style='color:#34d399'>₹{option_preview['target_price']:.2f}</span></strong></div><div class='calc-row'><span style='color:#94a3b8;'>Illustrative P&amp;L target / stop:</span><strong><span style='color:#34d399'>+₹{option_preview['target_pnl']:,.2f}</span> / <span style='color:#fb7185'>₹{option_preview['loss_pnl']:,.2f}</span></strong></div></div>", unsafe_allow_html=True)
+                            if option_action == "BUY" and not fo_trade_gate["allow_long_entry"]:
+                                st.warning(f"BUY is locked by the F&O Trade Gate: {fo_trade_gate['decision']}. These are planning values only.")
+                            if is_paper_trading:
+                                paper_key = f"paper_option_{option_action.lower()}_{selected_contract['token']}"
+                                paper_buy_locked = option_action == "BUY" and not fo_trade_gate["allow_long_entry"]
+                                if st.button(f"{'🟢' if option_action == 'BUY' else '🔴'} 📝 Log {option_action} paper position", width="stretch", key=paper_key, disabled=paper_buy_locked):
+                                    ok, message = place_paper_order(selected_contract["symbol"], option_action, option_quantity, option_snapshot["ltp"], option_stop, option_target)
+                                    (st.success if ok else st.error)(f"{'✅' if ok else '❌'} {message}")
+                            elif option_action == "SELL":
+                                st.warning("Live short-option submission is unavailable until a real broker margin/preflight check is implemented. Gross premium is not treated as available capital.")
+                            else:
+                                long_entry_allowed = fo_trade_gate["allow_long_entry"]
+                                if not long_entry_allowed:
+                                    st.markdown(f"<div class='live-arm-card'>🔒 <strong>LIVE BUY LOCKED BY F&amp;O TRADE GATE</strong> — {html.escape(fo_trade_gate['decision'])}. Wait for current-session broker evidence; this is not a BUY signal.</div>", unsafe_allow_html=True)
+                                else:
+                                    st.markdown("<div class='live-ready-card'>⚡ <strong>LIVE LONG-OPTION MARKET MODE</strong> — the broker must still accept the contract/product. Displayed SL/target are planning values, not broker-attached exits.</div>" if live_orders_armed else "<div class='live-arm-card'>🔒 <strong>LIVE MODE NOT ARMED</strong> — connect and arm Angel One below.</div>", unsafe_allow_html=True)
+                                option_confirm = st.checkbox(f"I understand: submit LIVE MARKET BUY {selected_contract['symbol']} ({option_quantity} qty) as INTRADAY after a fresh broker quote.", key=f"confirm_fo_buy_{selected_contract['token']}", disabled=not (live_orders_armed and long_entry_allowed))
+                                if st.button(f"🟢 ⚡ LIVE BUY MARKET {selected_contract['symbol']}", width="stretch", key=f"live_option_buy_{selected_contract['token']}", disabled=not (long_entry_allowed and live_orders_armed and option_confirm)):
+                                    with st.spinner("Refreshing broker premium and submitting your confirmed intraday order..."):
+                                        fresh_snapshot = fetch_selected_option_snapshot(broker_client, selected_contract)
+                                        if fresh_snapshot.get("ok"):
+                                            success, message, details = place_regular_order(broker_client, selected_contract, option_quantity, "BUY", "INTRADAY")
+                                        else:
+                                            success, message, details = False, f"Fresh broker LTP is required: {fresh_snapshot.get('message', 'unavailable')}", None
+                                    if success:
+                                        order_id = details.get("order_id") if isinstance(details, dict) else ""
+                                        st.session_state["last_live_submission"] = {"symbol": selected_contract["symbol"], "action": "BUY", "kind": "F&O INTRADAY MARKET", "order_id": order_id, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+                                        st.success(f"✅ LIVE F&O order submitted to Angel One{f' · Order ID: {order_id}' if order_id else ''}. Verify final status in the broker order book.")
+                                    else:
+                                        st.error(f"Live F&O order was not submitted: {message}")
+                    else:
+                        st.info("Connect Angel One to unlock a selected-contract risk preview. No premium is estimated.")
+
+                with st.expander("🔎 What is verified for this F&O view", expanded=False):
+                    st.dataframe(
+                        pd.DataFrame(build_fo_verification_rows(selected_contract, option_snapshot, candle_snapshot, option_evidence, selected_greeks)),
+                        width="stretch", hide_index=True,
+                        key=f"fo_verification_split_{selected_contract['token']}_{fo_interval}",
+                    )
+                with st.expander("📉 Selected CE/PE intraday chart", expanded=False):
+                    if candle_snapshot.get("ok") and not option_candles.empty:
+                        typical_price = (option_candles["High"] + option_candles["Low"] + option_candles["Close"]) / 3.0
+                        volume_total = option_candles["Volume"].fillna(0).cumsum().replace(0, np.nan)
+                        session_vwap = (typical_price * option_candles["Volume"].fillna(0)).cumsum() / volume_total
+                        option_fig = go.Figure(go.Candlestick(x=option_candles["time"], open=option_candles["Open"], high=option_candles["High"], low=option_candles["Low"], close=option_candles["Close"], name=selected_contract["symbol"], increasing_line_color="#34d399", decreasing_line_color="#fb7185"))
+                        option_fig.add_trace(go.Scatter(x=option_candles["time"], y=option_candles["Close"].ewm(span=9, adjust=False).mean(), mode="lines", name="EMA 9", line=dict(color="#22d3ee", width=1.2)))
+                        option_fig.add_trace(go.Scatter(x=option_candles["time"], y=option_candles["Close"].ewm(span=20, adjust=False).mean(), mode="lines", name="EMA 20", line=dict(color="#a78bfa", width=1.2)))
+                        if session_vwap.notna().any():
+                            option_fig.add_trace(go.Scatter(x=option_candles["time"], y=session_vwap, mode="lines", name="Session VWAP", line=dict(color="#fbbf24", width=1.2, dash="dot")))
+                        option_fig = apply_chart_style(option_fig, height=470)
+                        option_fig.update_xaxes(rangeslider_visible=False)
+                        st.plotly_chart(option_fig, width="stretch", key=f"fo_chart_split_{selected_contract['token']}_{fo_interval}")
+                        st.caption(broker_snapshot_caption(candle_snapshot) + " · current IST session only")
+                    elif candle_snapshot.get("ok"):
+                        st.info("Broker candles did not include the current 09:15–15:30 IST session, so no intraday chart is shown.")
+                    else:
+                        st.info(f"Intraday option chart unavailable: {candle_snapshot.get('message', 'Connect Angel One to load it.')}")
+
+# Retired vertical F&O layout retained only as unreachable reference while the
+# new split contract desk above is active. It does not run or fetch data.
+if False:
+    pass
+    fo_controls_1, fo_controls_2 = st.columns([3, 2])
+    with fo_controls_1:
+        fo_interval_label = st.selectbox("Intraday candle interval", list(FO_INTERVAL_OPTIONS.keys()), key="fo_interval")
+        fo_interval = FO_INTERVAL_OPTIONS[fo_interval_label]
+    with fo_controls_2:
+        if st.button("↻ Refresh Angel One master", width="stretch", key="refresh_fo_master"):
+            load_angel_option_master.clear()
+            st.rerun()
+
+    master_rows, master_error = load_angel_option_master()
+    if master_error:
+        st.error(master_error)
+        st.caption("No option price, OI, Greek, margin, or technical value is substituted while the official master is unavailable.")
+    else:
+        option_underlyings = extract_option_underlyings(master_rows)
+        if not option_underlyings:
+            st.warning("No current non-expired NFO option underlying was available in Angel One's master.")
+        else:
+            selected_underlying = st.selectbox("Underlying (Angel One NFO master)", option_underlyings, key="fo_underlying")
+            option_contracts = extract_option_contracts(master_rows, selected_underlying)
+            expiry_values = list(dict.fromkeys(contract["expiry_raw"] for contract in option_contracts))
+            expiry_labels = {contract["expiry_raw"]: contract["expiry_label"] for contract in option_contracts}
+            if not expiry_values:
+                st.warning(f"No live option contract is listed for {selected_underlying}.")
+            else:
+                choose_1, choose_2, choose_3 = st.columns(3)
+                with choose_1:
+                    selected_expiry = st.selectbox("Expiry", expiry_values, format_func=lambda value: expiry_labels[value], key=f"fo_expiry_{selected_underlying}")
+                expiry_contracts = [row for row in option_contracts if row["expiry_raw"] == selected_expiry]
+                available_sides = sorted({row["side"] for row in expiry_contracts})
+                with choose_2:
+                    selected_option_side = st.selectbox("Option side", available_sides, format_func=lambda value: "CALL (CE)" if value == "CE" else "PUT (PE)", key=f"fo_side_{selected_underlying}_{selected_expiry}", help="Choose CE/PE yourself. Neutral data never auto-selects a side.")
+                side_contracts = [row for row in expiry_contracts if row["side"] == selected_option_side]
+                strikes = sorted({row["strike"] for row in side_contracts})
+                with choose_3:
+                    selected_strike = st.selectbox("Strike", strikes, format_func=lambda value: f"₹{value:,.2f}", key=f"fo_strike_{selected_underlying}_{selected_expiry}_{selected_option_side}", help="Choose deliberately; ATM is not inferred from a separate public feed.")
+                selected_contract = next(row for row in side_contracts if row["strike"] == selected_strike)
+                broker_client = st.session_state.get("smart_api")
+                detail_1, detail_2, detail_3, detail_4 = st.columns(4)
+                detail_1.metric("Contract", selected_contract["symbol"])
+                detail_2.metric("Lot size", str(selected_contract["lot_size"]))
+                detail_3.metric("Tick size", "—" if selected_contract["tick_size"] is None else f"₹{selected_contract['tick_size']:.2f}")
+                if detail_4.button("↻ Refresh selected", width="stretch", key=f"refresh_fo_{selected_contract['token']}_{fo_interval}"):
+                    clear_selected_option_broker_cache(selected_contract, selected_underlying, selected_expiry, fo_interval)
+                    st.rerun()
+
+                option_snapshot = get_option_snapshot_for_ui(broker_client, selected_contract)
                 if option_snapshot.get("ok"):
                     st.session_state.setdefault("broker_option_prices", {})[selected_contract["symbol"]] = option_snapshot
-
-                detail_columns = st.columns(4)
-                detail_columns[0].metric("Selected contract", selected_contract["symbol"])
-                detail_columns[1].metric("Lot size", str(selected_contract["lot_size"]))
-                detail_columns[2].metric("Tick size", "—" if selected_contract["tick_size"] is None else f"₹{selected_contract['tick_size']:.2f}")
-                detail_columns[3].metric("Broker LTP", f"₹{option_snapshot['ltp']:.2f}" if option_snapshot.get("ok") else "Unavailable")
-
-                if option_snapshot.get("ok"):
+                    detail_4.metric("Broker LTP", f"₹{option_snapshot['ltp']:.2f}")
                     st.caption(broker_snapshot_caption(option_snapshot))
                 elif option_snapshot.get("state") == "disconnected":
-                    st.warning("Connect Angel One below to retrieve the selected contract's real LTP, Greeks, and chart. No stale or estimated premium is used.")
+                    detail_4.metric("Broker LTP", "Unavailable")
+                    st.warning("Connect Angel One below to load this selected contract's real LTP, intraday chart, Greeks, and OI. No stale or estimated premium is used.")
                 else:
+                    detail_4.metric("Broker LTP", "Unavailable")
                     st.error(f"Selected-contract price unavailable: {option_snapshot.get('message', 'Unknown broker error.')}")
 
+                candle_snapshot = get_option_candles_for_ui(broker_client, selected_contract, fo_interval)
+                option_candles = (
+                    normalise_broker_option_candles(candle_snapshot["candles"])
+                    if candle_snapshot.get("ok") else pd.DataFrame()
+                )
+                option_evidence = evaluate_intraday_option_evidence(option_candles)
+                fo_trade_gate = build_fo_trade_gate(option_snapshot, candle_snapshot, option_evidence)
+                st.markdown(
+                    """
+                    <div class="fo-trade-gate {tone}">
+                      <div class="fo-gate-heading">
+                        <span>🛡️ F&amp;O TRADE GATE</span>
+                        <span class="fo-gate-decision">{decision_note}</span>
+                      </div>
+                      <div class="fo-gate-grid">
+                        <div class="fo-gate-stat"><div class="fo-gate-label">Decision</div><div class="fo-gate-value">{decision}</div></div>
+                        <div class="fo-gate-stat"><div class="fo-gate-label">Conditions</div><div class="fo-gate-value">{conditions}</div><div class="fo-gate-note">{condition_detail}</div></div>
+                        <div class="fo-gate-stat"><div class="fo-gate-label">Risk status</div><div class="fo-gate-value">{risk_status}</div><div class="fo-gate-note">Selected contract only</div></div>
+                      </div>
+                      <div class="fo-gate-message">{message}</div>
+                    </div>
+                    """.format(**{key: html.escape(str(value)) for key, value in fo_trade_gate.items()}),
+                    unsafe_allow_html=True,
+                )
+
+                st.markdown("<h4 style='color:#fff; margin:18px 0 8px;'>Verified Selected-Contract Scan</h4>", unsafe_allow_html=True)
+                st.dataframe(
+                    pd.DataFrame([build_fo_intelligence_row(selected_contract, option_snapshot, candle_snapshot, option_evidence)]),
+                    width="stretch",
+                    hide_index=True,
+                    key=f"fo_contract_scan_{selected_contract['token']}_{fo_interval}",
+                )
+                st.caption("Premium and LTP Chg% use the selected contract's Angel One quote. Trend, VWAP, RSI, Buy, Sell, and Setup use only current-session broker candles for that same CE/PE premium. A dash means unavailable, not zero.")
+
+                selected_greeks = {}
+                greeks_snapshot = get_option_greeks_for_ui(broker_client, selected_underlying, selected_expiry)
                 if greeks_snapshot.get("ok"):
                     selected_greeks = selected_contract_greeks(greeks_snapshot["rows"], selected_contract)
                     if selected_greeks:
-                        greek_text = " · ".join(f"{label}: {value}" for label, value in selected_greeks.items())
-                        st.caption(f"Broker-reported Greeks/OI: {greek_text} · {broker_snapshot_caption(greeks_snapshot)}")
+                        st.caption("Broker-reported only: " + " · ".join(f"{label}: {value}" for label, value in selected_greeks.items()) + f" · {broker_snapshot_caption(greeks_snapshot)}")
                     else:
-                        st.caption("Angel One returned Greek data for this expiry, but no row could be safely matched to the selected contract.")
+                        st.caption("Greeks/OI were returned for this expiry but could not be matched safely to the selected contract.")
                 elif broker_client is not None:
-                    st.caption(f"Broker Greeks unavailable: {greeks_snapshot.get('message', 'Unknown response.')}")
+                    st.caption(f"Broker Greeks/OI unavailable: {greeks_snapshot.get('message', 'Unknown response.')}")
 
-                if option_snapshot.get("ok"):
-                    candle_snapshot = get_option_candles_for_ui(broker_client, selected_contract)
-                    if candle_snapshot.get("ok"):
-                        candle_df = pd.DataFrame(candle_snapshot["candles"], columns=["time", "Open", "High", "Low", "Close", "Volume"])
-                        candle_df["time"] = pd.to_datetime(candle_df["time"], errors="coerce")
-                        candle_df = candle_df.dropna(subset=["time", "Open", "High", "Low", "Close"])
-                        if not candle_df.empty:
-                            option_fig = go.Figure(go.Candlestick(
-                                x=candle_df["time"], open=candle_df["Open"], high=candle_df["High"],
-                                low=candle_df["Low"], close=candle_df["Close"], name=selected_contract["symbol"],
-                                increasing_line_color="#34d399", decreasing_line_color="#fb7185",
-                            ))
-                            option_fig = apply_chart_style(option_fig, height=320)
+                st.markdown("<h4 style='color:#fff; margin:18px 0 8px;'>🔎 What is verified for this F&O view</h4>", unsafe_allow_html=True)
+                st.dataframe(
+                    pd.DataFrame(build_fo_verification_rows(selected_contract, option_snapshot, candle_snapshot, option_evidence, selected_greeks)),
+                    width="stretch",
+                    hide_index=True,
+                    key=f"fo_verification_{selected_contract['token']}_{fo_interval}",
+                )
+
+                if candle_snapshot.get("ok"):
+                    if option_candles.empty:
+                        st.info("Broker candles did not include the current 09:15–15:30 IST session, so no intraday evidence is shown.")
+                    else:
+                        chart_column, evidence_column = st.columns([7.2, 2.8])
+                        with chart_column:
+                            typical_price = (option_candles["High"] + option_candles["Low"] + option_candles["Close"]) / 3.0
+                            volume_total = option_candles["Volume"].fillna(0).cumsum().replace(0, np.nan)
+                            session_vwap = (typical_price * option_candles["Volume"].fillna(0)).cumsum() / volume_total
+                            option_fig = go.Figure(go.Candlestick(x=option_candles["time"], open=option_candles["Open"], high=option_candles["High"], low=option_candles["Low"], close=option_candles["Close"], name=selected_contract["symbol"], increasing_line_color="#34d399", decreasing_line_color="#fb7185"))
+                            option_fig.add_trace(go.Scatter(x=option_candles["time"], y=option_candles["Close"].ewm(span=9, adjust=False).mean(), mode="lines", name="EMA 9", line=dict(color="#22d3ee", width=1.2)))
+                            option_fig.add_trace(go.Scatter(x=option_candles["time"], y=option_candles["Close"].ewm(span=20, adjust=False).mean(), mode="lines", name="EMA 20", line=dict(color="#a78bfa", width=1.2)))
+                            if session_vwap.notna().any():
+                                option_fig.add_trace(go.Scatter(x=option_candles["time"], y=session_vwap, mode="lines", name="Session VWAP", line=dict(color="#fbbf24", width=1.2, dash="dot")))
+                            option_fig = apply_chart_style(option_fig, height=470)
                             option_fig.update_xaxes(rangeslider_visible=False)
-                            st.plotly_chart(option_fig, width="stretch", key=f"option_chart_{selected_contract['token']}")
-                            st.caption(broker_snapshot_caption(candle_snapshot))
-                        else:
-                            st.caption("Broker returned an unreadable option-candle payload; no chart is shown.")
-                    else:
-                        st.caption(f"Option chart unavailable: {candle_snapshot.get('message', 'Unknown broker response.')}")
-
-                    opt_q1, opt_q2 = st.columns(2)
-                    with opt_q1:
-                        lots = st.number_input("Number of lots", min_value=1, value=1, step=1, key=f"option_lots_{selected_contract['token']}")
-                    with opt_q2:
-                        option_action = st.radio("Risk preview side", ["BUY", "SELL"], horizontal=True, key=f"option_preview_side_{selected_contract['token']}")
-
-                    minimum_step = selected_contract["tick_size"] or 0.05
-                    default_stop = max(minimum_step, round(option_snapshot["ltp"] * 0.15, 2))
-                    opt_sl_pts = st.number_input(
-                        "Risk points (₹)", min_value=float(minimum_step), value=float(default_stop),
-                        step=float(minimum_step), key=f"option_sl_{selected_contract['token']}",
-                    )
-                    opt_tp_pts = round(opt_sl_pts * 3, 2)
-                    total_contracts = int(lots) * selected_contract["lot_size"]
-                    option_preview = calculate_directional_preview(
-                        option_action, option_snapshot["ltp"], opt_sl_pts, opt_tp_pts, total_contracts
-                    )
-                    premium_label = "Premium outlay (before charges)" if option_action == "BUY" else "Gross premium received (margin not calculated)"
-                    st.markdown(f"""
-                    <div class="calc-box">
-                        <div class="calc-row"><span style="color:#94a3b8;">Quantity ({int(lots)} lot × {selected_contract['lot_size']}):</span><strong style="color:#ffffff;">{total_contracts} Qty</strong></div>
-                        <div class="calc-row"><span style="color:#94a3b8;">{premium_label}:</span><strong style="color:#00f2fe; font-size:14px;">₹{option_preview['gross_notional']:,.2f}</strong></div>
-                        <div class="calc-row"><span style="color:#94a3b8;">{option_action} entry / stop / target:</span><strong style="color:#ffffff;">₹{option_preview['entry_price']:.2f} / <span style="color:#fb7185">₹{option_preview['stop_price']:.2f}</span> / <span style="color:#34d399">₹{option_preview['target_price']:.2f}</span></strong></div>
-                        <div class="calc-row"><span style="color:#94a3b8;">Illustrative P&L at target:</span><strong style="color:#34d399; font-size:14px;">+₹{option_preview['target_pnl']:,.2f}</strong></div>
-                        <div class="calc-row"><span style="color:#94a3b8;">Illustrative P&L at stop:</span><strong style="color:#fb7185; font-size:14px;">₹{option_preview['loss_pnl']:,.2f}</strong></div>
-                        <div class="calc-row" style="border-top:1px solid rgba(255,255,255,0.06); margin-top:4px; padding-top:4px;"><span style="color:#94a3b8;">Illustrative risk-to-reward:</span><strong style="color:#00f2fe;">1 : 3.00</strong></div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    st.caption("Illustrative P&L excludes brokerage, taxes, slippage, assignment risk, and broker-specific margin requirements.")
-
-                    if is_paper_trading:
-                        paper_label = f"📝 Log {option_action} paper position"
-                        btn_option_paper = st.button(
-                            paper_label, width="stretch", key=f"paper_option_{selected_contract['token']}_{option_action}",
-                        )
-                        if btn_option_paper:
-                            ok, msg = place_paper_order(
-                                selected_contract["symbol"], option_action, total_contracts, option_snapshot["ltp"], opt_sl_pts, opt_tp_pts
-                            )
-                            if ok:
-                                st.success(f"✅ {msg}")
+                            st.markdown("<div class='chart-shell'>", unsafe_allow_html=True)
+                            st.plotly_chart(option_fig, width="stretch", key=f"fo_chart_{selected_contract['token']}_{fo_interval}")
+                            st.markdown("</div>", unsafe_allow_html=True)
+                            st.caption(broker_snapshot_caption(candle_snapshot) + " · current IST session only")
+                        with evidence_column:
+                            evidence_summary = option_evidence["summary"]
+                            st.markdown(f"<div class='chart-inspector'><div class='brief-kicker'>Selected CE/PE premium · 10 broker checks</div><div class='brief-value'>{evidence_summary['regime']}</div><div class='brief-note'>Bullish {evidence_summary['buy_score']}/10 · Bearish {evidence_summary['sell_score']}/10 · Neutral {evidence_summary['neutral_count']}/10<br>Only this premium is evaluated; it is not a NIFTY/underlying direction or CE/PE recommendation.</div></div>", unsafe_allow_html=True)
+                            if option_evidence["message"]:
+                                st.caption(option_evidence["message"])
                             else:
-                                st.error(f"❌ {msg}")
-                    else:
-                        if live_orders_armed:
-                            st.markdown("<div class='live-ready-card'>⚡ <strong>LIVE F&O ROBO MODE ARMED</strong> — Angel One must still accept BO for your account and selected contract.</div>", unsafe_allow_html=True)
+                                st.markdown(evidence_items_html(option_evidence["checks"]), unsafe_allow_html=True)
+                else:
+                    st.info(f"Intraday option evidence unavailable: {candle_snapshot.get('message', 'Connect Angel One to load it.')}")
+
+                if fo_trade_gate["allow_risk_preview"]:
+                    st.markdown("<div class='bottom-card' style='margin-top:14px;'><div class='bottom-title'>💰 Selected Option Intraday Risk Preview</div><div style='font-size:12px;color:#94a3b8;'>Uses the selected broker premium. Charges, slippage, margin, and assignment risk are excluded.</div></div>", unsafe_allow_html=True)
+                    risk_1, risk_2, risk_3, risk_4 = st.columns(4)
+                    with risk_1:
+                        lots = st.number_input("Lots", min_value=1, value=1, step=1, key=f"fo_lots_{selected_contract['token']}")
+                    with risk_2:
+                        option_action = st.radio("Premium action", ["BUY", "SELL"], horizontal=True, key=f"fo_action_{selected_contract['token']}")
+                    minimum_step = float(selected_contract["tick_size"] or 0.05)
+                    with risk_3:
+                        default_stop = max(minimum_step, round(option_snapshot["ltp"] * 0.15, 2))
+                        option_stop = st.number_input("Risk points (₹)", min_value=minimum_step, value=default_stop, step=minimum_step, key=f"fo_stop_{selected_contract['token']}")
+                    with risk_4:
+                        option_target = st.number_input("Target points (₹)", min_value=minimum_step, value=float(round(option_stop * 3, 2)), step=minimum_step, key=f"fo_target_{selected_contract['token']}")
+                    option_quantity = int(lots) * selected_contract["lot_size"]
+                    try:
+                        option_preview = calculate_directional_preview(option_action, option_snapshot["ltp"], option_stop, option_target, option_quantity)
+                    except ValueError as exc:
+                        option_preview = None
+                        st.error(f"Option sizing needs valid values: {exc}")
+                    if option_preview:
+                        premium_label = "Premium outlay before charges" if option_action == "BUY" else "Gross premium received — broker margin is not calculated"
+                        st.markdown(f"<div class='calc-box'><div class='calc-row'><span style='color:#94a3b8;'>Quantity:</span><strong>{int(lots)} lot × {selected_contract['lot_size']} = {option_quantity}</strong></div><div class='calc-row'><span style='color:#94a3b8;'>{premium_label}:</span><strong style='color:#00f2fe;'>₹{option_preview['gross_notional']:,.2f}</strong></div><div class='calc-row'><span style='color:#94a3b8;'>{option_action} entry / stop / target:</span><strong>₹{option_preview['entry_price']:.2f} / <span style='color:#fb7185'>₹{option_preview['stop_price']:.2f}</span> / <span style='color:#34d399'>₹{option_preview['target_price']:.2f}</span></strong></div><div class='calc-row'><span style='color:#94a3b8;'>Illustrative P&L target / stop:</span><strong><span style='color:#34d399'>+₹{option_preview['target_pnl']:,.2f}</span> / <span style='color:#fb7185'>₹{option_preview['loss_pnl']:,.2f}</span></strong></div></div>", unsafe_allow_html=True)
+                        if option_action == "BUY" and not fo_trade_gate["allow_long_entry"]:
+                            st.warning(f"BUY is locked by the F&O Trade Gate: {fo_trade_gate['decision']}. These are planning values only.")
+                        if is_paper_trading:
+                            paper_key = f"paper_option_{option_action.lower()}_{selected_contract['token']}"
+                            paper_buy_locked = option_action == "BUY" and not fo_trade_gate["allow_long_entry"]
+                            if st.button(f"{'🟢' if option_action == 'BUY' else '🔴'} 📝 Log {option_action} paper position", width="stretch", key=paper_key, disabled=paper_buy_locked):
+                                ok, message = place_paper_order(selected_contract["symbol"], option_action, option_quantity, option_snapshot["ltp"], option_stop, option_target)
+                                (st.success if ok else st.error)(f"{'✅' if ok else '❌'} {message}")
+                        elif option_action == "SELL":
+                            st.warning("Live short-option submission is unavailable until a real broker margin/preflight check is implemented. Gross premium is not treated as available capital.")
                         else:
-                            st.markdown("<div class='live-arm-card'>🔒 <strong>LIVE F&O MODE NOT ARMED</strong> — enable the live-order acknowledgement in the broker gateway below.</div>", unsafe_allow_html=True)
-                        option_confirm = st.checkbox(
-                            f"I understand: submit LIVE {option_action} {selected_contract['symbol']} ({total_contracts} qty) at broker snapshot ₹{option_snapshot['ltp']:.2f}; SL offset ₹{opt_sl_pts:.2f}; target offset ₹{opt_tp_pts:.2f}",
-                            key=f"confirm_option_{selected_contract['token']}_{option_action}", disabled=not live_orders_armed,
-                        )
-                        option_button_key = f"live_option_{option_action.lower()}_{selected_contract['token']}"
-                        btn_option_live = st.button(
-                            f"{'🟢' if option_action == 'BUY' else '🔴'} ⚡ LIVE {option_action} ROBO {selected_contract['symbol']}",
-                            width="stretch", key=option_button_key,
-                            disabled=not (live_orders_armed and option_confirm),
-                        )
-                        if btn_option_live:
-                            with st.spinner("Refreshing broker LTP and submitting your confirmed F&O ROBO order..."):
-                                fresh_option_snapshot = fetch_selected_option_snapshot(broker_client, selected_contract)
-                                if fresh_option_snapshot.get("ok"):
-                                    success, message, details = place_bracket_robo_order(
-                                        broker_client, selected_contract, total_contracts, fresh_option_snapshot["ltp"],
-                                        opt_sl_pts, opt_tp_pts, option_action,
-                                    )
+                            long_entry_allowed = fo_trade_gate["allow_long_entry"]
+                            if not long_entry_allowed:
+                                st.markdown(f"<div class='live-arm-card'>🔒 <strong>LIVE BUY LOCKED BY F&amp;O TRADE GATE</strong> — {html.escape(fo_trade_gate['decision'])}. Wait for current-session broker evidence; this is not a BUY signal.</div>", unsafe_allow_html=True)
+                            else:
+                                st.markdown("<div class='live-ready-card'>⚡ <strong>LIVE LONG-OPTION MARKET MODE</strong> — the broker must still accept the contract/product. Displayed SL/target are planning values, not broker-attached exits.</div>" if live_orders_armed else "<div class='live-arm-card'>🔒 <strong>LIVE MODE NOT ARMED</strong> — connect and arm Angel One below.</div>", unsafe_allow_html=True)
+                            option_confirm = st.checkbox(f"I understand: submit LIVE MARKET BUY {selected_contract['symbol']} ({option_quantity} qty) as INTRADAY after a fresh broker quote.", key=f"confirm_fo_buy_{selected_contract['token']}", disabled=not (live_orders_armed and long_entry_allowed))
+                            if st.button(f"🟢 ⚡ LIVE BUY MARKET {selected_contract['symbol']}", width="stretch", key=f"live_option_buy_{selected_contract['token']}", disabled=not (long_entry_allowed and live_orders_armed and option_confirm)):
+                                with st.spinner("Refreshing broker premium and submitting your confirmed intraday order..."):
+                                    fresh_snapshot = fetch_selected_option_snapshot(broker_client, selected_contract)
+                                    if fresh_snapshot.get("ok"):
+                                        success, message, details = place_regular_order(broker_client, selected_contract, option_quantity, "BUY", "INTRADAY")
+                                    else:
+                                        success, message, details = False, f"Fresh broker LTP is required: {fresh_snapshot.get('message', 'unavailable')}", None
+                                if success:
+                                    order_id = details.get("order_id") if isinstance(details, dict) else ""
+                                    st.session_state["last_live_submission"] = {"symbol": selected_contract["symbol"], "action": "BUY", "kind": "F&O INTRADAY MARKET", "order_id": order_id, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+                                    st.success(f"✅ LIVE F&O order submitted to Angel One{f' · Order ID: {order_id}' if order_id else ''}. Verify final status in the broker order book.")
                                 else:
-                                    success, message, details = False, f"Fresh broker LTP is required before submission: {fresh_option_snapshot.get('message', 'unavailable')}", None
-                            if success:
-                                order_id = details.get("order_id") if isinstance(details, dict) else ""
-                                st.session_state["last_live_submission"] = {
-                                    "symbol": selected_contract["symbol"], "action": option_action, "kind": "F&O ROBO",
-                                    "order_id": order_id, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                }
-                                st.success(f"✅ LIVE F&O order submitted to Angel One{f' · Order ID: {order_id}' if order_id else ''}. Check the broker order book for final status.")
-                            else:
-                                st.error(f"Live F&O order was not submitted: {message}")
+                                    st.error(f"Live F&O order was not submitted: {message}")
+
 
 # =========================================================================
 # TAB 3: PAPER TRADING PORTFOLIO & LEDGER DESK
@@ -2566,44 +4732,191 @@ with tab_backtest:
 # TAB 5: S/R CHART ANALYSIS
 # =========================================================================
 with tab_chart:
-    st.markdown("<h3 style='color:#fff; margin-bottom:4px;'>Support & Resistance Extrema Analysis</h3>", unsafe_allow_html=True)
-    c_sym = st.selectbox("Select Asset for Visual Levels", symbols, key="c_sym")
+    st.markdown("<h3 style='color:#fff; margin-bottom:4px;'>TradingView-Style Support & Resistance Desk</h3>", unsafe_allow_html=True)
+    st.caption("Left: interactive price chart. Right: asset, timeframe, verified source state, and current levels. Public chart data can be delayed and is never replaced with a made-up price.")
+    chart_left, chart_right = st.columns([7.3, 2.7])
+    with chart_right:
+        st.markdown("<div class='chart-inspector'><div class='brief-kicker'>Chart controls</div>", unsafe_allow_html=True)
+        c_sym = st.selectbox("Asset", symbols, key="c_sym")
+        chart_timeframe = st.selectbox("Timeframe", list(CHART_TIMEFRAME_MAP.keys()), key="chart_timeframe")
+        chart_period, chart_interval, chart_extrema_order = CHART_TIMEFRAME_MAP[chart_timeframe]
+        st.caption("Pan, zoom, hover, and inspect levels directly on the chart.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    c_raw, chart_feed_message = download_public_chart_data(c_sym, period=period, interval=interval, progress=False)
+    c_raw, chart_feed_message = download_public_chart_data(c_sym, period=chart_period, interval=chart_interval, progress=False)
     if isinstance(c_raw.columns, pd.MultiIndex):
         c_raw.columns = c_raw.columns.get_level_values(0)
-    c_raw.dropna(inplace=True)
+    c_raw = c_raw.dropna().copy()
 
     if chart_feed_message:
-        st.warning(f"Chart unavailable — {chart_feed_message} No prices were substituted.")
+        with chart_left:
+            st.warning(f"Chart unavailable — {chart_feed_message} No prices were substituted.")
+        with chart_right:
+            st.error("Data source unavailable")
     elif len(c_raw) > 20:
-        highs = argrelextrema(c_raw['High'].values, np.greater, order=extrema_order)[0]
-        lows = argrelextrema(c_raw['Low'].values, np.less, order=extrema_order)[0]
-
+        highs = argrelextrema(c_raw['High'].values, np.greater, order=chart_extrema_order)[0]
+        lows = argrelextrema(c_raw['Low'].values, np.less, order=chart_extrema_order)[0]
         c_raw['Res'] = np.nan
         c_raw['Sup'] = np.nan
         c_raw.loc[c_raw.index[highs], 'Res'] = c_raw.iloc[highs]['High']
         c_raw.loc[c_raw.index[lows], 'Sup'] = c_raw.iloc[lows]['Low']
         c_raw['Nearest_Res'] = c_raw['Res'].ffill()
         c_raw['Nearest_Sup'] = c_raw['Sup'].ffill()
-
-        fig_chart = go.Figure()
-        fig_chart.add_trace(go.Candlestick(
-            x=c_raw.index, open=c_raw['Open'], high=c_raw['High'], low=c_raw['Low'], close=c_raw['Close'], name="Price",
-            increasing_line_color="#34d399", decreasing_line_color="#fb7185"
-        ))
-        fig_chart.add_trace(go.Scatter(
-            x=c_raw.index, y=c_raw['Nearest_Res'], mode='lines', line_shape='hv', line=dict(color='#fb7185', dash='dash', width=1.5), name='Resistance'
-        ))
-        fig_chart.add_trace(go.Scatter(
-            x=c_raw.index, y=c_raw['Nearest_Sup'], mode='lines', line_shape='hv', line=dict(color='#34d399', dash='dash', width=1.5), name='Support'
-        ))
-
-        fig_chart = apply_chart_style(fig_chart, height=550)
-        fig_chart.update_xaxes(rangeslider_visible=False)
-        st.plotly_chart(fig_chart, width="stretch")
+        c_raw['EMA20'] = c_raw['Close'].ewm(span=20, adjust=False).mean()
+        c_raw['EMA50'] = c_raw['Close'].ewm(span=50, adjust=False).mean()
+        last_price = float(c_raw['Close'].iloc[-1])
+        prior_price = float(c_raw['Close'].iloc[-2])
+        change_pct = (last_price - prior_price) / prior_price * 100
+        latest_resistance = c_raw['Nearest_Res'].iloc[-1]
+        latest_support = c_raw['Nearest_Sup'].iloc[-1]
+        with chart_left:
+            fig_chart = go.Figure()
+            fig_chart.add_trace(go.Candlestick(
+                x=c_raw.index, open=c_raw['Open'], high=c_raw['High'], low=c_raw['Low'], close=c_raw['Close'], name="Price",
+                increasing_line_color="#34d399", decreasing_line_color="#fb7185"
+            ))
+            fig_chart.add_trace(go.Scatter(x=c_raw.index, y=c_raw['EMA20'], mode='lines', line=dict(color='#22d3ee', width=1.2), name='EMA 20'))
+            fig_chart.add_trace(go.Scatter(x=c_raw.index, y=c_raw['EMA50'], mode='lines', line=dict(color='#a78bfa', width=1.2), name='EMA 50'))
+            fig_chart.add_trace(go.Scatter(x=c_raw.index, y=c_raw['Nearest_Res'], mode='lines', line_shape='hv', line=dict(color='#fb7185', dash='dash', width=1.4), name='Resistance'))
+            fig_chart.add_trace(go.Scatter(x=c_raw.index, y=c_raw['Nearest_Sup'], mode='lines', line_shape='hv', line=dict(color='#34d399', dash='dash', width=1.4), name='Support'))
+            fig_chart = apply_chart_style(fig_chart, height=625)
+            fig_chart.update_xaxes(rangeslider_visible=False)
+            st.markdown("<div class='chart-shell'>", unsafe_allow_html=True)
+            st.plotly_chart(fig_chart, width="stretch", key=f"sr_chart_{c_sym}_{chart_interval}")
+            st.markdown("</div>", unsafe_allow_html=True)
+        with chart_right:
+            direction_colour = "#34d399" if change_pct >= 0 else "#fb7185"
+            st.markdown(f"""
+            <div class="brief-card" style="margin-top:12px;">
+                <div class="brief-kicker">{c_sym.replace('.NS', '').replace('.BO', '')} · {chart_timeframe}</div>
+                <div class="brief-value">₹{last_price:,.2f}</div>
+                <div class="brief-note" style="color:{direction_colour}; font-weight:800;">{change_pct:+.2f}% from prior bar</div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.metric("Nearest resistance", "—" if pd.isna(latest_resistance) else f"₹{latest_resistance:,.2f}")
+            st.metric("Nearest support", "—" if pd.isna(latest_support) else f"₹{latest_support:,.2f}")
+            st.metric("EMA 20 / 50", f"₹{c_raw['EMA20'].iloc[-1]:,.2f} / ₹{c_raw['EMA50'].iloc[-1]:,.2f}")
+            st.caption("Verified public chart snapshot. Source time reflects the latest candle returned by the provider.")
     else:
-        st.info("Insufficient verified chart history for this asset; no support or resistance levels are shown.")
+        with chart_left:
+            st.info("Insufficient verified chart history for this asset; no support or resistance levels are shown.")
+        with chart_right:
+            st.warning("Need at least 21 usable candles")
+
+# =========================================================================
+# TAB 6: MARKET BRIEF & OFFICIAL NEWS CONTEXT
+# =========================================================================
+with tab_news:
+    st.markdown("<h3 style='color:#fff; margin-bottom:4px;'>Mahi Morning Brief</h3>", unsafe_allow_html=True)
+    st.caption("A source-attributed market context board inspired by your sample report. It is information for review, not a BUY/SELL tip engine or a promise of market direction.")
+
+    @st.cache_data(ttl=600, show_spinner=False)
+    def load_official_market_news():
+        return fetch_official_news_feeds(OFFICIAL_NEWS_SOURCES)
+
+    @st.cache_data(ttl=300, show_spinner=False)
+    def load_global_market_watch():
+        return download_public_chart_data(
+            list(GLOBAL_MARKET_WATCH.values()), period="5d", interval="1d", group_by="ticker", progress=False, threads=True,
+        )
+
+    news_button_col, schedule_note_col = st.columns([2.2, 7.8])
+    with news_button_col:
+        if st.button("↻ Refresh brief", width="stretch", key="refresh_morning_brief"):
+            load_official_market_news.clear()
+            load_global_market_watch.clear()
+            st.rerun()
+    with schedule_note_col:
+        st.caption("The in-app brief refreshes when opened. Automatic pre-market delivery is intentionally not enabled until you choose a delivery channel and schedule.")
+
+    # Today's verified watchlist breadth is drawn from the same delayed public
+    # data used by the Equity tab; unavailable rows never become zero values.
+    brief_rows = df_results.copy() if isinstance(df_results, pd.DataFrame) else pd.DataFrame()
+    if not brief_rows.empty:
+        advancing = int((brief_rows["Chg%"] > 0).sum())
+        declining = int((brief_rows["Chg%"] < 0).sum())
+        unchanged = int((brief_rows["Chg%"] == 0).sum())
+        technical_bullish = int((brief_rows["Setup"] == "BUY_SETUP").sum())
+        technical_bearish = int((brief_rows["Setup"] == "BEARISH_SETUP").sum())
+        technical_neutral = len(brief_rows) - technical_bullish - technical_bearish
+        breadth_text = f"{advancing} advancing · {declining} declining · {unchanged} unchanged"
+        technical_text = f"{technical_bullish} bullish evidence · {technical_bearish} bearish evidence · {technical_neutral} no-trade/mixed"
+    else:
+        breadth_text = "Unavailable — no verified constituent chart rows"
+        technical_text = "Unavailable — no technical evidence rows"
+
+    brief_1, brief_2, brief_3 = st.columns(3)
+    with brief_1:
+        st.markdown(f"<div class='brief-card'><div class='brief-kicker'>Universe breadth</div><div class='brief-value'>{selected_basket}</div><div class='brief-note'>{breadth_text}</div></div>", unsafe_allow_html=True)
+    with brief_2:
+        st.markdown(f"<div class='brief-card'><div class='brief-kicker'>Technical evidence</div><div class='brief-value'>Review, don’t predict</div><div class='brief-note'>{technical_text}</div></div>", unsafe_allow_html=True)
+    with brief_3:
+        st.markdown(f"<div class='brief-card'><div class='brief-kicker'>Data freshness</div><div class='brief-value'>{ist_now().strftime('%H:%M')} IST</div><div class='brief-note'>Index membership: {html.escape(str(basket_snapshot['state']))}. Public chart data may be delayed; broker snapshots are labelled separately.</div></div>", unsafe_allow_html=True)
+
+    st.markdown("<h4 style='color:#fff; margin:22px 0 8px;'>Official India Market Bulletin</h4>", unsafe_allow_html=True)
+    news_snapshot = load_official_market_news()
+    if news_snapshot["items"]:
+        source_category = {row["name"]: row["category"] for row in OFFICIAL_NEWS_SOURCES}
+        for news_item in news_snapshot["items"]:
+            category = source_category.get(news_item["source"], "Official update")
+            news_col, open_col = st.columns([8.2, 1.8])
+            with news_col:
+                st.markdown(f"**[{html.escape(category)}] {html.escape(news_item['title'])}**")
+                st.caption(f"{news_item['source']} · published {news_item['published'] or 'time not supplied by feed'}")
+            with open_col:
+                st.link_button("Open original", news_item["link"], width="stretch", key=f"official_news_{news_item['source']}_{hashlib.sha1(news_item['title'].encode()).hexdigest()[:10]}")
+    else:
+        st.info("Official news feeds have not returned readable headlines. No headline or analysis is substituted.")
+    if news_snapshot["errors"]:
+        st.caption("Feed status: " + " | ".join(news_snapshot["errors"]))
+    else:
+        st.caption(f"Official-feed snapshot fetched {news_snapshot['fetched_at']}. Headlines are links only; article text is not copied.")
+
+    st.markdown("<h4 style='color:#fff; margin:22px 0 8px;'>Global Market Context</h4>", unsafe_allow_html=True)
+    global_raw, global_error = load_global_market_watch()
+    global_rows = []
+    if not global_error:
+        for market_name, ticker in GLOBAL_MARKET_WATCH.items():
+            try:
+                market_frame = global_raw[ticker] if isinstance(global_raw.columns, pd.MultiIndex) else global_raw
+                market_frame = market_frame.dropna(subset=["Close"])
+                if len(market_frame) < 2:
+                    continue
+                latest = float(market_frame["Close"].iloc[-1])
+                previous = float(market_frame["Close"].iloc[-2])
+                global_rows.append({"Market": market_name, "Last close": latest, "Change": latest - previous, "Change %": (latest - previous) / previous * 100})
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+    if global_rows:
+        st.dataframe(
+            pd.DataFrame(global_rows), width="stretch", hide_index=True,
+            column_config={
+                "Last close": st.column_config.NumberColumn(format="%.2f"),
+                "Change": st.column_config.NumberColumn(format="%+.2f"),
+                "Change %": st.column_config.NumberColumn(format="%+.2f%%"),
+            },
+        )
+        st.caption("Public end-of-day/global snapshot; it is context only and may not reflect the Indian cash-market open.")
+    else:
+        st.info(f"Global public market snapshot unavailable. {global_error or 'No usable rows returned.'}")
+
+    st.markdown("<h4 style='color:#fff; margin:22px 0 8px;'>Professional Pre-Market Routine</h4>", unsafe_allow_html=True)
+    routine_col_1, routine_col_2 = st.columns(2)
+    with routine_col_1:
+        st.markdown("""
+        <div class='brief-card'>
+          <div class='brief-kicker'>Before market open</div>
+          <div class='brief-note'>1. Check data timestamps and official announcements.<br>2. Mark only liquid symbols and planned levels.<br>3. Set your own maximum loss and maximum number of trades before the first order.<br>4. Write the entry, invalidation, and reason before acting.</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with routine_col_2:
+        st.markdown("""
+        <div class='brief-card'>
+          <div class='brief-kicker'>During and after market</div>
+          <div class='brief-note'>5. Treat a mixed/sideways evidence panel as permission to wait.<br>6. Do not turn a news headline into an automatic trade.<br>7. Record execution, stop, exit, and rule-following in the journal.<br>8. Review a meaningful sample of trades before changing a rule.</div>
+        </div>
+        """, unsafe_allow_html=True)
+    st.caption("Official feed sources currently loaded: SEBI, RBI, and PIB. NSE's corporate RSS directory can be added once a stable machine-readable endpoint is verified. For major global breaking-news coverage, use a provider with a display/redistribution licence rather than scraping publisher pages.")
 
 # =========================================================================
 # BOTTOM SECTION: ANGEL ONE GATEWAY
@@ -2612,6 +4925,7 @@ st.write("")
 st.markdown("""
 <div class="bottom-card">
     <div class="bottom-title">🔗 Angel One SmartAPI Gateway</div>
+    <div style="font-size:12px; color:#94a3b8;">Use <strong>↻ Refresh data</strong> above to reload cached market snapshots. Non-sensitive workspace choices can be remembered; API key, Client ID, MPIN, TOTP, access tokens, and broker sessions are never written to the app settings file.</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -2625,12 +4939,13 @@ with ao_c2:
 
 ao_btn_col, ao_status_col = st.columns([1.5, 2.5])
 with ao_btn_col:
-    if st.button("Connect Broker", width="stretch"):
+    if st.button("Connect / Refresh Broker", width="stretch"):
         if all([ao_api_key, ao_client, ao_pin, ao_totp_key]):
             api_obj, res_msg = connect_angel_one(ao_api_key, ao_client, ao_pin, ao_totp_key)
             if api_obj:
                 st.session_state["smart_api"] = api_obj
                 st.session_state["live_orders_armed"] = False
+                clear_all_short_lived_broker_cache()
                 st.success("Broker session connected. Live controls remain locked until you explicitly arm them below.")
             else:
                 st.error(f"Failed: {res_msg}")
@@ -2641,6 +4956,8 @@ with ao_status_col:
         st.markdown("<span style='color:#34d399; font-size:13px; font-weight:700; line-height:38px;'>● BROKER SESSION ACTIVE</span>", unsafe_allow_html=True)
     else:
         st.markdown("<span style='color:#94a3b8; font-size:13px; font-weight:500; line-height:38px;'>Status: Disconnected</span>", unsafe_allow_html=True)
+
+st.caption("For a restart-friendly local setup, you may place credentials yourself in `.streamlit/secrets.toml` under `angel_one`. Do not put them in `app.py`, the saved workspace JSON, or a shared report. A new broker login may still be required when the session or TOTP expires.")
 
 if "smart_api" in st.session_state and LIVE_ORDER_EXECUTION_ENABLED:
     st.markdown("<div class='live-arm-card'><strong>Live-order safety gate</strong><br>Arming enables controls only. Each BUY or SELL still needs its own confirmation, and a broker response means <em>submitted</em>, not filled.</div>", unsafe_allow_html=True)
