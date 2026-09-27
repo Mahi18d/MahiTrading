@@ -6,3 +6,6 @@ index_constituents_cache.json.tmp
 
 .streamlit/secrets.toml
 secrets.toml
+
+.streamlit/secrets.toml
+secrets.toml
