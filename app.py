@@ -1,4 +1,5 @@
 import csv
+import copy
 import base64
 import concurrent.futures
 from datetime import datetime, timedelta
@@ -16,6 +17,7 @@ import uuid
 import time
 import importlib.util
 import urllib.request
+import requests
 from urllib.parse import quote
 import html
 import xml.etree.ElementTree as ET
@@ -1348,7 +1350,8 @@ def evaluate_equity_intelligence_scan(symbols, intraday_data, daily_data, extrem
             orb_low = float(pd.to_numeric(session_frame["Low"], errors="coerce").iloc[:opening_bars].min())
             session_open = float(pd.to_numeric(session_frame["Open"], errors="coerce").iloc[0])
 
-            previous = float(close.iloc[-2])
+            previous_sessions = close.loc[pd.DatetimeIndex(close.index).date < pd.Timestamp(close.index[-1]).date()]
+            previous = float(previous_sessions.iloc[-1]) if len(previous_sessions) else np.nan
             last_bar_change = ((ltp - previous) / previous * 100.0) if previous > 0 else np.nan
             session_change = ((ltp - session_open) / session_open * 100.0) if session_open > 0 else np.nan
             rsi_value = _as_float(rsi.iloc[-1])
@@ -1433,7 +1436,7 @@ def evaluate_equity_intelligence_scan(symbols, intraday_data, daily_data, extrem
                 "Buy": f"{buy_score}/10",
                 "Sell": f"{sell_score}/10",
                 "Setup": setup,
-                "Data status": "PUBLIC CHART FEED · MAY BE DELAYED",
+                "Data status": source_status(frame.index[-1], interval or "15m") + " · may be delayed",
             })
         except (KeyError, TypeError, ValueError, IndexError, AttributeError):
             rows.append(_unavailable_equity_scan_row(symbol))
@@ -1459,7 +1462,7 @@ def _fetch_equity_and_daily_data(symbols, period, interval):
 if "--self-test" in sys.argv:
     fetch_equity_and_daily_data = _fetch_equity_and_daily_data
 else:
-    fetch_equity_and_daily_data = st.cache_data(ttl=180, show_spinner=False)(_fetch_equity_and_daily_data)
+    fetch_equity_and_daily_data = st.cache_data(ttl=30, show_spinner=False)(_fetch_equity_and_daily_data)
 
 
 def validate_equity_trade_policy(horizon, action, order_kind, product_type):
@@ -2299,6 +2302,236 @@ def render_setup_signal(signal, title="Price-action setup"):
         st.caption(f"Completed source candle: {signal['candle_time']} · {signal.get('interval')}. Rules-based evidence; no measured win rate claimed.")
 
 
+def owner_identity_allowed(user, owner_email):
+    return bool(owner_email and user.get("email_verified") is True
+                and str(user.get("email", "")).casefold() == str(owner_email).strip().casefold()
+                and user.get("iss") in {"https://accounts.google.com", "accounts.google.com"})
+
+
+def require_owner_access():
+    try:
+        owner_email = st.secrets.get("app_access", {}).get("owner_email", "")
+        auth_ready = bool(st.secrets.get("auth", {}).get("client_id"))
+    except Exception:
+        owner_email, auth_ready = "", False
+    if not owner_email or not auth_ready:
+        st.title("Mahi Trading · Private")
+        st.info("Owner sign-in needs configuration. Follow PRIVATE_SETUP.md in your project; the app stays locked until setup is complete.")
+        st.stop()
+    if not st.user.is_logged_in:
+        st.title("Mahi Trading · Private")
+        if st.button("Sign in with Google", key="owner_login"):
+            st.login()
+        st.stop()
+    if not owner_identity_allowed(st.user, owner_email):
+        st.error("This account does not have access to Mahi Trading.")
+        if st.button("Sign out", key="denied_logout"):
+            st.logout()
+        st.stop()
+    st.session_state["owner_id"] = hashlib.sha256(str(owner_email).strip().casefold().encode()).hexdigest()
+    if st.sidebar.button("Sign out of Mahi Trading", key="owner_logout"):
+        st.session_state.clear()
+        st.logout()
+        st.stop()
+
+
+def validate_paper_account(data):
+    """Reject malformed imports/storage without silently replacing the account."""
+    if not isinstance(data, dict) or not {"cash", "positions", "closed_trades"} <= data.keys():
+        raise ValueError("Invalid paper journal structure.")
+    cash = _as_float(data["cash"])
+    if cash is None or not np.isfinite(cash):
+        raise ValueError("Invalid paper cash balance.")
+    fields = {"id", "symbol", "action", "qty", "entry_price", "sl_price", "tp_price", "sl_pts", "tp_pts",
+              "trail_pts", "timestamp", "status", "setup", "entry_reason", "source", "timeframe", "lesson",
+              "auto_exit", "contract", "exit_price", "pnl", "exit_reason", "exit_time"}
+    cleaned, seen = {"cash": cash, "positions": [], "closed_trades": []}, set()
+    for group in ("positions", "closed_trades"):
+        if not isinstance(data[group], list) or len(data[group]) > 20000:
+            raise ValueError("Invalid paper trade list.")
+        for original in data[group]:
+            if not isinstance(original, dict):
+                raise ValueError("Invalid paper trade.")
+            row = {k: copy.deepcopy(v) for k, v in original.items() if k in fields}
+            identity = row.get("id")
+            if not isinstance(identity, str) or not identity or identity in seen:
+                raise ValueError("Missing or duplicate trade ID.")
+            seen.add(identity)
+            if row.get("action") not in {"BUY", "SELL"} or not isinstance(row.get("symbol"), str):
+                raise ValueError("Invalid paper symbol or direction.")
+            for field in ("qty", "entry_price", "sl_price", "tp_price"):
+                value = _as_float(row.get(field))
+                if value is None or not np.isfinite(value) or value <= 0:
+                    raise ValueError("Invalid paper quantity or price.")
+                row[field] = value
+            if row["qty"] != int(row["qty"]) or not isinstance(row.get("timestamp"), str):
+                raise ValueError("Invalid quantity or entry time.")
+            row["qty"] = int(row["qty"])
+            if group == "closed_trades":
+                exit_price, pnl = _as_float(row.get("exit_price")), _as_float(row.get("pnl"))
+                if exit_price is None or pnl is None or not np.isfinite([exit_price, pnl]).all() or exit_price <= 0:
+                    raise ValueError("Invalid closed-trade result.")
+                expected = (exit_price-row["entry_price"])*row["qty"]*(1 if row["action"] == "BUY" else -1)
+                if abs(pnl-expected) > 0.02 or not isinstance(row.get("exit_time"), str):
+                    raise ValueError("Closed-trade P&L does not match its prices.")
+            if isinstance(row.get("contract"), dict):
+                row["contract"] = {k: v for k, v in row["contract"].items()
+                                   if k in {"exchange", "symbol", "token", "lot_size", "tick_size", "side", "strike", "underlying", "expiry_raw"}}
+            cleaned[group].append(row)
+    # Ensures no NaN or non-JSON values enter durable storage.
+    json.dumps(cleaned, allow_nan=False)
+    return cleaned
+
+
+class PaperStore:
+    """Server-side Supabase RPC client. Revisions prevent lost updates across tabs."""
+    def __init__(self, url, key, owner, post=None):
+        if not re.fullmatch(r"https://[a-z0-9-]+\.supabase\.co", str(url).rstrip("/")) or not key or not owner:
+            raise ValueError("Configure the Supabase project URL and server secret key.")
+        self.url, self.key, self.owner = str(url).rstrip("/"), key, owner
+        self.post = post or requests.post
+
+    def rpc(self, name, payload):
+        headers = {"apikey": self.key, "Content-Type": "application/json"}
+        if not str(self.key).startswith("sb_secret_"):
+            headers["Authorization"] = f"Bearer {self.key}"
+        try:
+            reply = self.post(f"{self.url}/rest/v1/rpc/{name}", headers=headers, json=payload, timeout=12)
+            if reply.status_code != 200:
+                raise RuntimeError("Paper storage request failed. Check the database configuration and retry.")
+            result = reply.json()
+            if not isinstance(result, dict):
+                raise RuntimeError("Paper storage returned an invalid response.")
+            return result
+        except requests.RequestException:
+            raise RuntimeError("Paper storage is unreachable. No successful save can be confirmed.") from None
+
+    def read(self):
+        result = self.rpc("mahi_read_account", {"p_owner": self.owner})
+        result["data"] = validate_paper_account(result["data"])
+        return result
+
+    def save(self, data, revision):
+        result = self.rpc("mahi_save_account", {"p_owner": self.owner,
+            "p_expected_revision": int(revision), "p_data": validate_paper_account(data)})
+        if result.get("conflict"):
+            raise RuntimeError("Another tab changed this account. Refresh the portfolio before trying again.")
+        if result.get("revision") != revision + 1:
+            raise RuntimeError("Paper save was not confirmed. Refresh to check the stored account before retrying.")
+        return result
+
+
+def paper_store():
+    config = st.secrets.get("supabase", {})
+    return PaperStore(config.get("url", ""), config.get("service_key", ""), st.session_state["owner_id"])
+
+
+def source_status(timestamp, interval="15m", source="Public chart", now=None):
+    try:
+        stamp = pd.Timestamp(timestamp)
+        if pd.isna(stamp):
+            return f"{source} · unavailable"
+        stamp = stamp.tz_localize(IST_TIMEZONE) if stamp.tzinfo is None else stamp.tz_convert(IST_TIMEZONE)
+        current = pd.Timestamp(now or ist_now())
+        current = current.tz_localize(IST_TIMEZONE) if current.tzinfo is None else current.tz_convert(IST_TIMEZONE)
+        minutes = {"1m":1,"5m":5,"15m":15,"30m":30,"60m":60,"1d":1440,"1wk":10080}.get(interval,15)
+        age = (current-stamp).total_seconds()
+        stale = age < 0 or age > (minutes+5)*60
+        label = "stale" if stale else "latest returned"
+        return f"{source} · {label} · {stamp:%d %b %H:%M} IST"
+    except (TypeError, ValueError):
+        return f"{source} · unavailable"
+
+
+def stock_row_colours(row):
+    def colour(value):
+        number = _as_float(value)
+        return "color: " + ("#34d399" if number is not None and number > 0 else "#fb7185" if number is not None and number < 0 else "#94a3b8")
+    return [colour(row.get("Chg%")) if col in {"Symbol", "Price", "Chg%"}
+            else colour(row.get(col)) if col == "Session Δ%" else "" for col in row.index]
+
+
+def portfolio_totals(account, prices):
+    realized = sum(t["pnl"] for t in account["closed_trades"])
+    unrealized, missing = 0.0, 0
+    for position in account["positions"]:
+        price = _as_float(prices.get(position["symbol"]))
+        if price is None or not np.isfinite(price) or price <= 0:
+            missing += 1
+            continue
+        unrealized += (price-position["entry_price"])*position["qty"]*(1 if position["action"] == "BUY" else -1)
+    return {"realized": realized, "unrealized": unrealized, "missing": missing,
+            "total": None if missing else realized+unrealized}
+
+
+class RecoveringBroker:
+    """Serialize reads; recover authentication once. Order methods are never retried."""
+    READS = {"ltpData", "getMarketData", "getCandleData", "optionGreek", "orderBook", "position", "rmsLimit"}
+
+    def __init__(self, client, reconnect=None, clock=None, sleep=None):
+        self.client, self.reconnect = client, reconnect
+        self.clock, self.sleep = clock or time.time, sleep or time.sleep
+        self.lock = threading.RLock()
+        self.last_request, self.last_success, self.next_recovery = 0, 0, 0
+        self.status, self.generation = "Connected · awaiting data", 0
+
+    @staticmethod
+    def auth_failure(reply):
+        if not isinstance(reply, dict) or reply.get("status") is not False:
+            return False
+        message = str(reply.get("message", "")).lower()
+        return str(reply.get("errorcode", "")) in {"AG8001", "AG8002", "AG8003"} or any(
+            term in message for term in ("invalid token", "token expired", "invalid jwt", "session expired"))
+
+    def __getattr__(self, name):
+        if name not in self.READS:
+            return getattr(self.client, name)
+        def read(*args, **kwargs):
+            with self.lock:
+                def invoke():
+                    self.sleep(max(0, 1.1 - (self.clock()-self.last_request)))
+                    self.last_request = self.clock()
+                    return getattr(self.client, name)(*args, **kwargs)
+                try:
+                    reply = invoke()
+                except Exception:
+                    self.status = "Read failed · connection retained"
+                    raise RuntimeError("Broker read failed; retry later or check connectivity.") from None
+                if self.auth_failure(reply) and self.clock() >= self.next_recovery:
+                    self.next_recovery = self.clock()+120
+                    recovered = False
+                    try:
+                        token = getattr(self.client, "refresh_token", None)
+                        renewal = self.client.generateToken(token) if token else {}
+                        recovered = isinstance(renewal, dict) and renewal.get("status") is True
+                        if recovered and renewal.get("data", {}).get("refreshToken"):
+                            self.client.setRefreshToken(renewal["data"]["refreshToken"])
+                    except Exception:
+                        pass
+                    if not recovered and self.reconnect:
+                        new_client, _ = self.reconnect()
+                        if new_client is not None:
+                            self.client, recovered = new_client, True
+                    if recovered:
+                        self.generation += 1
+                        reply = invoke()
+                if isinstance(reply, dict) and reply.get("status") is True:
+                    self.last_success = self.clock()
+                    self.status = "Authenticated read succeeded"
+                elif self.auth_failure(reply):
+                    self.status = "Login expired · reconnect required"
+                else:
+                    self.status = "Broker read rejected · check data details"
+                return reply
+        return read
+
+
+@st.cache_resource(show_spinner=False)
+def owner_broker_holder(owner_id):
+    # Only reached after the verified owner gate; survives browser-session resets.
+    return {"broker": None, "paused": False, "next_login": 0.0, "lock": threading.RLock()}
+
+
 def run_self_tests():
     """Network-free regression checks, callable with: python app.py --self-test."""
     assert importlib.util.find_spec("streamlit") is not None, "streamlit is not installed"
@@ -2659,6 +2892,8 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed"
 )
+
+require_owner_access()
 
 # --- Professional Dark Abstract Multi-Color Glassmorphic Theme ---
 st.markdown("""
@@ -3053,23 +3288,39 @@ def save_safe_ui_settings(settings):
 def clear_all_short_lived_broker_cache():
     """Forget volatile broker snapshots while leaving the authenticated object untouched."""
     for key in list(st.session_state.keys()):
-        if key.startswith(("option_snapshot_", "option_greeks_", "option_candles_", "fo5_chain_")):
+        if key.startswith(("option_snapshot_", "option_greeks_", "option_candles_", "fo5_chain_", "index_strip_quotes", "paper_quotes_", "equity_quotes_")):
             st.session_state.pop(key, None)
 
 def load_paper_account():
-    # A public Streamlit server has one filesystem for all visitors. A global
-    # JSON account leaks portfolios across browser sessions; keep it private.
-    return {
-        "cash": 500000.0,
-        "positions": [],
-        "closed_trades": []
-    }
+    try:
+        result = paper_store().read()
+        st.session_state["paper_revision"] = int(result["revision"])
+        st.session_state["paper_committed"] = copy.deepcopy(result["data"])
+        st.session_state["paper_saved_at"] = result.get("updated_at", "")
+        return result["data"]
+    except Exception:
+        st.error("Your saved paper account could not be loaded. Check Supabase setup in PRIVATE_SETUP.md and retry. An empty account has not been substituted.")
+        if st.button("Retry paper storage", key="retry_storage"):
+            st.rerun()
+        st.stop()
 
 def save_paper_account(data):
-    st.session_state["paper_data"] = data
+    try:
+        cleaned = validate_paper_account(data)
+        result = paper_store().save(cleaned, st.session_state["paper_revision"])
+    except Exception as exc:
+        st.session_state["paper_data"] = copy.deepcopy(st.session_state["paper_committed"])
+        message = str(exc) if isinstance(exc, (RuntimeError, ValueError)) else "Paper save failed; refresh to check the stored account."
+        st.error(message)
+        st.download_button("Export last confirmed account", json.dumps(st.session_state["paper_committed"]), "mahi-last-confirmed.json")
+        st.stop()
+    st.session_state["paper_data"] = cleaned
+    st.session_state["paper_committed"] = copy.deepcopy(cleaned)
+    st.session_state["paper_revision"] = result["revision"]
+    st.session_state["paper_saved_at"] = result.get("updated_at", "")
 
-if "paper_data" not in st.session_state:
-    st.session_state["paper_data"] = load_paper_account()
+# Every full rerun reads the authoritative revision; browser sessions aren't storage.
+st.session_state["paper_data"] = load_paper_account()
 
 def place_paper_order(symbol, action, qty, entry_price, sl_pts, tp_pts, trail_pts=0.0, metadata=None):
     pdata = st.session_state["paper_data"]
@@ -3291,7 +3542,35 @@ def connect_angel_one(api_key: str, client_code: str, pin: str, totp_secret: str
     except Exception as e:
         return None, str(e)
 
-# Saved owner credentials must never auto-connect every visitor of a public app.
+def saved_broker_login():
+    # This path is only callable after require_owner_access has succeeded.
+    return connect_angel_one(def_api_key, def_client_id, def_pin, def_totp)
+
+
+def retain_broker(client, use_saved=False):
+    holder = owner_broker_holder(st.session_state["owner_id"])
+    holder["broker"] = RecoveringBroker(client, saved_broker_login if use_saved else None)
+    holder["paused"] = False
+    st.session_state["smart_api"] = holder["broker"]
+
+
+def restore_broker():
+    holder = owner_broker_holder(st.session_state["owner_id"])
+    with holder["lock"]:
+        if (holder["broker"] is None and not holder["paused"] and time.time() >= holder["next_login"]
+                and all([def_api_key, def_client_id, def_pin, def_totp])
+                and st.secrets.get("angel_one", {}).get("auto_connect", True)):
+            holder["next_login"] = time.time()+120
+            client, _ = saved_broker_login()
+            if client is not None:
+                retain_broker(client, use_saved=True)
+        if holder["broker"] is not None and not holder["paused"]:
+            st.session_state["smart_api"] = holder["broker"]
+        else:
+            st.session_state.pop("smart_api", None)
+
+
+restore_broker()
 
 
 def _cached_broker_result(cache_key, ttl_seconds, fetcher):
@@ -3315,8 +3594,108 @@ def get_option_snapshot_for_ui(smart_api, contract):
     return _cached_broker_result(
         f"option_snapshot_{contract_identity}",
         OPTION_SNAPSHOT_TTL_SECONDS,
-        lambda: fetch_selected_option_snapshot(smart_api, contract),
+        lambda: fetch_snapshot_with_fallback(smart_api, contract),
     )
+
+
+def fetch_snapshot_with_fallback(client, contract):
+    snapshot = fetch_selected_option_snapshot(client, contract)
+    if snapshot.get("ok") or snapshot.get("state") == "mismatch" or not hasattr(client, "getMarketData"):
+        return snapshot
+    batch = fetch_broker_market_data(client, [contract])
+    row = batch.get("quotes", {}).get(fo_contract_key(contract), {})
+    if _as_float(row.get("ltp")) and row["ltp"] > 0:
+        return dict(row, ok=True, state="snapshot", fetched_at=batch["fetched_at"], source="Angel One FULL quote")
+    return dict(snapshot, message=snapshot.get("message", "") + " · " + batch.get("message", ""))
+
+
+def index_quote_snapshot():
+    master, error = load_angel_option_master()
+    contracts = {name: resolve_fo_index_spot_contract(master, name) for name in FO_INDEX_UNIVERSE}
+    valid = [contract for contract in contracts.values() if contract]
+    snapshot = _cached_broker_result("index_strip_quotes", 30,
+        lambda: fetch_broker_market_data(st.session_state.get("smart_api"), valid))
+    return contracts, snapshot
+
+
+def render_index_strip():
+    contracts, snapshot = index_quote_snapshot()
+    for column, (name, spec) in zip(st.columns(5), FO_INDEX_UNIVERSE.items()):
+        with column:
+            row = snapshot.get("quotes", {}).get(fo_contract_key(contracts.get(name)), {})
+            price, previous = _as_float(row.get("ltp")), _as_float(row.get("close"))
+            caption = "Angel One snapshot · exchange time not supplied"
+            if row.get("broker_timestamp"):
+                caption = source_status(row["broker_timestamp"], "1m", "Angel One")
+            if price is None or price <= 0:
+                frame, _ = fetch_fo_public_index_chart(spec["chart_symbol"], "5d", "1d")
+                close = pd.to_numeric(frame.get("Close", pd.Series(dtype=float)), errors="coerce").dropna()
+                price = float(close.iloc[-1]) if len(close) else None
+                previous = float(close.iloc[-2]) if len(close) > 1 else None
+                caption = source_status(close.index[-1], "1d", "Public daily") if len(close) else "Data unavailable"
+            delta = price-previous if price is not None and previous is not None and previous > 0 else None
+            display_name = "NIFTY Midcap Select" if name == "NIFT Midcap" else name
+            st.metric(display_name, f"₹{price:,.2f}" if price is not None else "—",
+                delta=f"{delta:+,.2f} ({delta/previous*100:+.2f}%)" if delta is not None else None)
+            st.caption(caption)
+
+
+def broker_quote_prices(positions):
+    client = st.session_state.get("smart_api")
+    if client is None or not positions:
+        return {}, []
+    contracts = []
+    for p in positions:
+        contract = p.get("contract")
+        if not contract:
+            contract, _ = resolve_angel_equity_contract(p["symbol"], p["symbol"]+".NS")
+        if contract:
+            contracts.append(dict(contract, paper_symbol=p["symbol"]))
+    quotes, messages = {}, []
+    for start in range(0, len(contracts), 50):
+        part = contracts[start:start+50]
+        identity = hashlib.sha256("|".join(sorted(fo_contract_key(c) for c in part)).encode()).hexdigest()[:16]
+        snapshot = _cached_broker_result("paper_quotes_"+identity, 30, lambda: fetch_broker_market_data(client, part))
+        for c in part:
+            row = snapshot.get("quotes", {}).get(fo_contract_key(c), {})
+            number = _as_float(row.get("ltp"))
+            if number is not None and number > 0 and np.isfinite(number):
+                stamp = row.get("broker_timestamp")
+                if stamp and ("stale" in source_status(stamp,"1m","Angel") or "unavailable" in source_status(stamp,"1m","Angel")):
+                    continue
+                quotes[c["paper_symbol"]] = number
+        if snapshot.get("message"):
+            messages.append(snapshot["message"])
+    return quotes, messages
+
+
+def add_equity_broker_quotes(results, chart_symbols):
+    """Separate spot quotes from chart-derived prices/indicators, never relabel candles."""
+    result = results.copy()
+    result['Broker LTP'] = float('nan')
+    result['Quote status'] = 'Broker disconnected'
+    client = st.session_state.get('smart_api')
+    if client is None:
+        return result
+    contracts = []
+    for symbol in chart_symbols:
+        clean = symbol.removesuffix('.NS').removesuffix('.BO')
+        contract, _ = resolve_angel_equity_contract(clean, symbol)
+        if contract:
+            contracts.append(dict(contract, display_symbol=clean))
+    result['Quote status'] = 'Broker connected · quote unavailable'
+    for start in range(0, len(contracts), 50):
+        part = contracts[start:start+50]
+        identity = hashlib.sha256('|'.join(fo_contract_key(c) for c in part).encode()).hexdigest()[:16]
+        snapshot = _cached_broker_result('equity_quotes_'+identity, 30, lambda: fetch_broker_market_data(client, part))
+        for contract in part:
+            mask = result['Symbol'] == contract['display_symbol']
+            quote = snapshot.get('quotes', {}).get(fo_contract_key(contract), {})
+            price = _as_float(quote.get('ltp'))
+            if price is not None and np.isfinite(price) and price > 0:
+                result.loc[mask, 'Broker LTP'] = price
+                result.loc[mask, 'Quote status'] = source_status(quote['broker_timestamp'], '1m', 'Angel One') if quote.get('broker_timestamp') else 'Angel One snapshot · exchange time unavailable'
+    return result
 
 
 def get_option_greeks_for_ui(smart_api, underlying, expiry_raw, exchange="NFO"):
@@ -3583,6 +3962,7 @@ def build_fo_compact_index_overview(chart_timeframe):
     symbols = [spec["chart_symbol"] for spec in FO_INDEX_UNIVERSE.values()]
     results, checklists, _ = evaluate_equity_intelligence_scan(symbols, batch, pd.DataFrame(), 3)
     result_by_symbol = {str(row.get("Symbol")): row for _, row in results.iterrows()} if not results.empty else {}
+    contracts, broker_snapshot = index_quote_snapshot()
     rows = []
     for index_name, spec in FO_INDEX_UNIVERSE.items():
         result = result_by_symbol.get(spec["chart_symbol"].removesuffix(".NS").removesuffix(".BO"), {})
@@ -3601,13 +3981,20 @@ def build_fo_compact_index_overview(chart_timeframe):
             bias = "NEUTRAL / NO TRADE"
         else:
             bias = "DATA REQUIRED"
+        note = str(result.get('Data status', 'Public context · may be delayed')) if price is not None else f"DATA UNAVAILABLE · {errors.get(index_name, 'No usable public chart')}"
+        quote = broker_snapshot.get('quotes', {}).get(fo_contract_key(contracts.get(index_name)), {})
+        broker_price, previous = _as_float(quote.get('ltp')), _as_float(quote.get('close'))
+        if broker_price is not None and np.isfinite(broker_price) and broker_price > 0:
+            price = broker_price
+            change = (price / previous - 1) * 100 if previous is not None and previous > 0 else None
+            note = (source_status(quote['broker_timestamp'], '1m', 'Angel One quote') if quote.get('broker_timestamp') else 'Angel One snapshot · exchange time unavailable') + ' · technical score uses public candles'
         rows.append({
             "Contract": index_name,
             "Underlying LTP": price,
             "Chg%": change,
-            "Score": f"{buy or 0}/10 Buy · {sell or 0}/10 Sell" if price is not None else "— / 10",
+            "Score": f"{buy or 0}/10 Buy · {sell or 0}/10 Sell" if buy is not None and sell is not None else "— / 10",
             "Technical Bias": bias,
-            "Data note": "PUBLIC CONTEXT · MAY BE DELAYED" if price is not None else f"DATA UNAVAILABLE · {errors.get(index_name, 'No usable public chart')}",
+            "Data note": note,
         })
     return pd.DataFrame(rows), checklists, frames
 
@@ -3649,7 +4036,7 @@ def render_fo_index_desk(is_paper_trading, live_orders_armed, compact=False):
             selected_name = str(overview.iloc[selected_rows[0]]["Contract"])
             if selected_name in FO_INDEX_UNIVERSE:
                 st.session_state["fo5_index"] = selected_name
-        st.caption("Select a row to inspect it below. This table is public underlying context only; option prices, chain fields, Greeks and order planning remain Angel One broker data only.")
+        st.caption("Select a row to inspect it below. Spot prices prefer Angel One when available; technical scores use public candles. Option prices, chain fields, Greeks and order planning require broker data.")
     else:
         index_columns = st.columns(len(FO_INDEX_UNIVERSE))
         for column, index_name in zip(index_columns, FO_INDEX_UNIVERSE):
@@ -3739,7 +4126,7 @@ def render_fo_index_desk(is_paper_trading, live_orders_armed, compact=False):
         st.session_state.pop(side_key, None)
     with selection_2:
         selected_side = st.radio(
-            "Option side", available_sides,
+            "Choose CALL (CE) or PUT (PE)", available_sides,
             format_func=lambda side: "CALL (CE)" if side == "CE" else "PUT (PE)",
             horizontal=True, key=side_key,
             help="Choose the CE or PE deliberately. The app never flips side automatically from an underlying signal.",
@@ -4212,7 +4599,11 @@ st.markdown(f"""<div class="header-box">
 </div>
 </div>""", unsafe_allow_html=True)
 
+render_index_strip()
+
 with st.sidebar:
+    refresh_seconds = st.selectbox("Auto refresh (while app is open)", [0, 30, 60, 120], index=2,
+                                   format_func=lambda value: "Off" if not value else f"Every {value} seconds", key="auto_refresh_seconds")
     st.caption("Session risk budgets · optional warnings")
     risk_per_trade = st.number_input("Maximum planned loss per trade (₹)", min_value=0.0, value=0.0, step=100.0, key="risk_per_trade")
     risk_daily_loss = st.number_input("Paper daily loss budget (₹)", min_value=0.0, value=0.0, step=100.0, key="risk_daily_loss")
@@ -4366,6 +4757,8 @@ with main_tab_equity:
     df_results, checklists, current_live_prices = evaluate_equity_intelligence_scan(
         symbols, data, daily_data, extrema_order, interval=interval,
     )
+    df_results = add_equity_broker_quotes(df_results, symbols)
+    st.caption("Price, change and indicators use the labelled candle feed. Broker LTP and Quote status are separate spot snapshots; connecting does not turn public candles into broker data.")
     # Only current-session intraday observations may trigger a simulated exit.
     # Historical daily/weekly closes are context, not executable current prices.
     paper_observations = {}
@@ -4394,13 +4787,14 @@ with main_tab_equity:
 
     with col_left:
         grid = st.dataframe(
-            filtered_df,
+            filtered_df.style.apply(stock_row_colours, axis=1),
             width="stretch",
             hide_index=True,
             on_select="rerun",
             selection_mode="single-row",
             column_config={
                 "Price": st.column_config.NumberColumn(format="₹%.2f"),
+                "Broker LTP": st.column_config.NumberColumn(format="₹%.2f"),
                 "Chg%": st.column_config.NumberColumn(format="%+.2f%%"),
                 "VWAP": st.column_config.NumberColumn(format="₹%.2f"),
                 "RSI": st.column_config.NumberColumn(format="%.1f"),
@@ -5105,9 +5499,10 @@ if False:
 # =========================================================================
 with tab_paper_ledger:
     pdata = st.session_state["paper_data"]
-    st.caption("Private browser-session paper account. Export the journal before a browser/session reset; old local paper_trades.json files are not loaded or overwritten.")
+    st.caption(f"Private database account · saved revision {st.session_state['paper_revision']}. Existing local paper_trades.json files are not modified.")
     render_risk_budget(is_paper=True)
-    if st.button("↻ Refresh open F&O paper quotes", key="refresh_paper_fo_quotes", disabled=st.session_state.get("smart_api") is None):
+    if st.button("↻ Refresh portfolio quotes", key="refresh_paper_fo_quotes"):
+        clear_all_short_lived_broker_cache()
         for position in pdata.get("positions", [])[:30]:
             contract = position.get("contract")
             if not contract:
@@ -5126,6 +5521,15 @@ with tab_paper_ledger:
     c3.metric("Virtual capital at cost", f"₹{cur_equity:,.2f}")
     c4.metric("Total Realized P&L", f"{total_realized_pnl:+,.2f}", delta=f"{((cur_equity-500000)/500000)*100:+.2f}%")
 
+    portfolio_prices = dict(paper_observations)
+    broker_prices, quote_messages = broker_quote_prices(pdata['positions'])
+    portfolio_prices.update(broker_prices)
+    totals = portfolio_totals(pdata, portfolio_prices)
+    pnl1, pnl2 = st.columns(2)
+    pnl1.metric("Open P&L · available quotes", f"₹{totals['unrealized']:+,.2f}")
+    pnl2.metric("Overall P&L · realized + open", "Unavailable" if totals['total'] is None else f"₹{totals['total']:+,.2f}")
+    st.caption(f"Snapshot valuation; excludes costs. {totals['missing']} positions missing fresh prices. Overall P&L is not estimated when prices are missing.")
+
     st.write("")
     st.markdown("<h4 style='color:#fff; margin-bottom:8px;'>Open Paper Positions (Available-Feed Monitoring)</h4>", unsafe_allow_html=True)
     
@@ -5133,7 +5537,7 @@ with tab_paper_ledger:
         open_rows = []
         for p in pdata["positions"]:
             sym = p["symbol"]
-            cur_price = paper_observations.get(sym)
+            cur_price = portfolio_prices.get(sym)
             if cur_price is None:
                 broker_snapshot = st.session_state.get("broker_option_prices", {}).get(sym, {})
                 snapshot_age = time.time() - broker_snapshot.get("fetched_at", 0)
@@ -5202,7 +5606,8 @@ with tab_paper_ledger:
     else:
         st.caption("Intraday equity paper exits are checked on available recent feed snapshots during app runs. F&O and long-term paper plans can be closed manually above. Nothing is monitored while the app is asleep.")
 
-    if st.button("🔄 Reset Paper Trading Account to ₹5,00,000"):
+    confirm_reset = st.checkbox("I want to erase the saved paper account", key="confirm_paper_reset")
+    if st.button("🔄 Reset Paper Trading Account to ₹5,00,000", disabled=not confirm_reset):
         st.session_state["paper_data"] = {
             "cash": 500000.0,
             "positions": [],
@@ -5213,11 +5618,25 @@ with tab_paper_ledger:
         st.rerun()
 
     render_paper_journal()
+    with st.expander("Restore a paper journal JSON"):
+        uploaded = st.file_uploader("Journal backup", type=['json'], key='paper_import')
+        if uploaded is not None:
+            try:
+                imported = validate_paper_account(json.loads(uploaded.getvalue()))
+                st.caption(f"{len(imported['positions'])} open trades · {len(imported['closed_trades'])} closed trades")
+                confirmed = st.checkbox("Replace the saved account with this backup", key='confirm_paper_import')
+                if st.button("Save imported journal", disabled=not confirmed):
+                    save_paper_account(imported)
+                    st.rerun()
+            except (ValueError, TypeError, KeyError):
+                st.error("Invalid journal. The stored account has not been changed.")
 
 # =========================================================================
 # TAB 4: BACKTEST ENGINE
 # =========================================================================
 with tab_backtest:
+    if st.button("↻ Refresh backtest view", key="refresh_backtest"):
+        st.rerun()
     st.markdown("<h3 style='color:#fff; margin-bottom:4px;'>Historical Backtest Engine</h3>", unsafe_allow_html=True)
     st.caption("Quantifies Breakouts & EMA regime pullbacks with simulated capital curves.")
 
@@ -5295,6 +5714,8 @@ with tab_backtest:
 # TAB 5: S/R CHART ANALYSIS
 # =========================================================================
 with tab_chart:
+    if st.button("↻ Refresh chart", key="refresh_chart"):
+        st.rerun()
     st.markdown("<h3 style='color:#fff; margin-bottom:4px;'>TradingView-Style Support & Resistance Desk</h3>", unsafe_allow_html=True)
     st.caption("Left: interactive price chart. Right: asset, timeframe, verified source state, and current levels. Public chart data can be delayed and is never replaced with a made-up price.")
     chart_left, chart_right = st.columns([7.3, 2.7])
@@ -5450,7 +5871,7 @@ with ao_btn_col:
         if all([ao_api_key, ao_client, ao_pin, ao_totp_key]):
             api_obj, res_msg = connect_angel_one(ao_api_key, ao_client, ao_pin, ao_totp_key)
             if api_obj:
-                st.session_state["smart_api"] = api_obj
+                retain_broker(api_obj)
                 st.session_state["live_orders_armed"] = False
                 st.session_state["live_order_acknowledgement"] = False
                 st.session_state.pop("broker_account_view", None)
@@ -5462,46 +5883,33 @@ with ao_btn_col:
             st.warning("Fill in all credentials.")
 with ao_status_col:
     if "smart_api" in st.session_state:
-        st.markdown("<span style='color:#34d399; font-size:13px; font-weight:700; line-height:38px;'>● BROKER SESSION ACTIVE</span>", unsafe_allow_html=True)
+        broker = st.session_state['smart_api']
+        st.caption(getattr(broker, 'status', 'Connected · quote availability checked separately'))
+        if getattr(broker, 'last_success', 0):
+            st.caption(f"Last successful broker read: {max(0, int(time.time()-broker.last_success))} seconds ago")
     else:
         st.markdown("<span style='color:#94a3b8; font-size:13px; font-weight:500; line-height:38px;'>Status: Disconnected</span>", unsafe_allow_html=True)
 
 if all([def_api_key, def_client_id, def_pin, def_totp]):
-    try:
-        owner_password_hash = str(st.secrets.get("app_access", {}).get("password_sha256", ""))
-    except Exception:
-        owner_password_hash = ""
     with st.expander("Connect using saved owner credentials", expanded=False):
-        if not re.fullmatch(r"[0-9a-fA-F]{64}", owner_password_hash):
-            st.info("Saved owner credentials are protected on this public app. Configure app_access.password_sha256 in Streamlit Secrets to unlock them, or use your own manual login above.")
-        else:
-            with st.form("owner_unlock"):
-                owner_password = st.text_input("Owner access password", type="password")
-                if st.form_submit_button("Unlock saved connection"):
-                    cooldown = st.session_state.get("owner_retry_after", 0)
-                    if time.time() < cooldown:
-                        st.warning("Wait before trying another password.")
-                    elif hmac.compare_digest(hashlib.sha256(owner_password.encode()).hexdigest(), owner_password_hash.lower()):
-                        st.session_state["owner_unlocked"] = True
-                        st.success("Saved connection unlocked for this session.")
-                    else:
-                        st.session_state["owner_retry_after"] = time.time() + 5
-                        st.error("Access password did not match.")
-            if st.button("Connect saved owner broker", disabled=not st.session_state.get("owner_unlocked", False), key="connect_owner_broker"):
-                owner_client, owner_message = connect_angel_one(def_api_key, def_client_id, def_pin, def_totp)
-                if owner_client:
-                    st.session_state["smart_api"] = owner_client
-                    st.session_state["live_orders_armed"] = False
-                    st.session_state["live_order_acknowledgement"] = False
-                    st.session_state.pop("broker_account_view", None)
-                    clear_all_short_lived_broker_cache()
-                    st.rerun()
-                else:
-                    st.error("Saved broker login failed. Verify credentials privately in Streamlit Secrets.")
+        st.caption("Available only after verified owner sign-in. Credentials stay on the server.")
+        if st.button("Connect saved owner broker", key="connect_owner_broker"):
+            owner_client, owner_message = saved_broker_login()
+            if owner_client:
+                retain_broker(owner_client, use_saved=True)
+                st.session_state["live_orders_armed"] = False
+                st.session_state["live_order_acknowledgement"] = False
+                clear_all_short_lived_broker_cache()
+                st.rerun()
+            else:
+                st.error("Saved broker login failed. Verify credentials privately in Streamlit Secrets.")
 st.caption("Credentials are never prefilled from server secrets or saved in your journal. Reconnect when the broker session expires.")
 
 if st.session_state.get("smart_api") is not None:
     if st.button("Disconnect broker and lock this session", key="disconnect_broker"):
+        holder = owner_broker_holder(st.session_state['owner_id'])
+        with holder['lock']:
+            holder.update(broker=None, paused=True)
         for private_key in ("smart_api", "owner_unlocked", "broker_account_view", "broker_option_prices", "last_live_submission"):
             st.session_state.pop(private_key, None)
         st.session_state["live_orders_armed"] = False
@@ -5535,3 +5943,12 @@ if last_live_submission:
         f"{last_live_submission['kind']} · Order ID: {order_id} · {last_live_submission['timestamp']}. "
         "Verify its actual status in Angel One's order book."
     )
+
+# Timer only requests a new read/render. Button events are not replayed.
+st.session_state['last_full_render'] = time.time()
+if refresh_seconds:
+    @st.fragment(run_every=refresh_seconds)
+    def refresh_market_timer():
+        if time.time() - st.session_state.get('last_full_render', 0) >= refresh_seconds:
+            st.rerun()
+    refresh_market_timer()

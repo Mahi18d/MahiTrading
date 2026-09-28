@@ -1,6 +1,7 @@
 """Offline Streamlit interaction checks; never connect to an actual broker."""
 from datetime import datetime, timedelta
 import json
+import copy
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -40,10 +41,38 @@ def offline_url(request, **kwargs):
 
 
 class UIBatchTests(unittest.TestCase):
+    def test_unapproved_account_cannot_load_data(self):
+        class User(dict):
+            is_logged_in = True
+        with patch('streamlit.user', User(email='other@example.com', email_verified=True, iss='https://accounts.google.com')), patch('streamlit.secrets', {'auth':{'client_id':'test'},'app_access':{'owner_email':'owner@example.com'}}), patch('requests.post') as database, patch('yfinance.download') as feed:
+            app = AppTest.from_file(str(Path(__file__).with_name('app.py'))).run(timeout=15)
+            self.assertFalse(app.exception, str(app.exception))
+            self.assertEqual(len(app.tabs),0)
+            self.assertTrue(any('does not have access' in item.value for item in app.error))
+            database.assert_not_called()
+            feed.assert_not_called()
+
     def test_controls_long_term_journal_and_disconnected_fo(self):
         st.cache_data.clear()
-        fake_secrets = {'angel_one': {'api_key':'TEST_ONLY','client_id':'TEST_ONLY','mpin':'TEST_ONLY','totp_secret':'TEST_ONLY'}}
-        with patch('streamlit.secrets', fake_secrets), patch('yfinance.download',side_effect=chart_fixture), patch('urllib.request.urlopen',side_effect=offline_url):
+        st.cache_resource.clear()
+        fake_secrets = {'angel_one': {'auto_connect':False}, 'auth':{'client_id':'test'}, 'app_access':{'owner_email':'owner@example.com'}, 'supabase':{'url':'https://test.supabase.co','service_key':'sb_secret_test'}}
+        class User(dict):
+            is_logged_in = True
+        user = User(email='owner@example.com', email_verified=True, iss='https://accounts.google.com')
+        saved = {'revision':0, 'data':{'cash':500000.,'positions':[], 'closed_trades':[]}}
+        def database(url, **kwargs):
+            payload = kwargs['json']
+            result = saved
+            if url.endswith('mahi_save_account'):
+                if payload['p_expected_revision'] != saved['revision']:
+                    result = {'conflict':True}
+                else:
+                    saved.update(revision=saved['revision']+1, data=copy.deepcopy(payload['p_data']))
+            class Reply:
+                status_code = 200
+                def json(self): return copy.deepcopy(result)
+            return Reply()
+        with patch('streamlit.user', user), patch('streamlit.secrets', fake_secrets), patch('requests.post',side_effect=database), patch('yfinance.download',side_effect=chart_fixture), patch('urllib.request.urlopen',side_effect=offline_url):
             app = AppTest.from_file(str(Path(__file__).with_name('app.py'))).run(timeout=45)
             self.assertFalse(app.exception, str(app.exception))
             self.assertEqual(len(app.tabs),6)
@@ -73,6 +102,9 @@ class UIBatchTests(unittest.TestCase):
             self.assertEqual(positions[0]['tp_price'],130)
             self.assertIs(positions[0]['auto_exit'],False)
             self.assertNotIn('smart_api',app.session_state)
+            reopened = AppTest.from_file(str(Path(__file__).with_name('app.py'))).run(timeout=45)
+            self.assertFalse(reopened.exception, str(reopened.exception))
+            self.assertEqual(reopened.session_state['paper_data']['positions'][0]['id'], positions[0]['id'])
 
 
 if __name__ == '__main__':
